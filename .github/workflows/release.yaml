@@ -6,15 +6,15 @@ on:
       - "*.*.*"
 
 env:
-  GO_VERSION: '1.24'
-  PY_VERSION: '3.14'
+  GO_VERSION: '1.25'
+  HUGO_VERSION: '0.154.3'
 
 jobs:
 
   build-role:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build Ansible Role Tarball
         run: |
@@ -50,10 +50,11 @@ jobs:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: minipaas-cli/go.sum
 
       - name: Install dependencies
         run: go mod tidy
@@ -71,30 +72,22 @@ jobs:
           name: minipaas-${{ matrix.goos }}-${{ matrix.goarch }}
           path: minipaas-cli/build/minipaas*
 
-  build-sql:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: minipaas-sql
-          path: minipaas-sql/*.sql
-
   build-docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          python-version: ${{ env.PY_VERSION }}
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: docs/go.sum
 
-      - name: Install system dependencies for Pillow
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libjpeg-dev zlib1g-dev libpng-dev libfreetype6-dev
+      - name: Set up Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
 
       - name: Build docs
         run: make build-docs
@@ -103,11 +96,11 @@ jobs:
         id: deployment
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: docs/public
 
   release:
     runs-on: ubuntu-latest
-    needs: [build-cli, build-sql, build-role, build-docs]
+    needs: [build-cli, build-role, build-docs]
     permissions:
       contents: write
     steps:
@@ -117,12 +110,6 @@ jobs:
           path: ./release-artifacts
           pattern: minipaas-*
           merge-multiple: true
-
-      - name: Download SQL Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: minipaas-sql
-          path: ./release-artifacts
 
       - name: Download Ansible Role Artifacts
         uses: actions/download-artifact@v4

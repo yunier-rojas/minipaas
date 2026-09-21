@@ -1,27 +1,28 @@
 package main
 
 import (
-	"fmt"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type CodeCronArgs struct {
 	BaseArgs
-	Services []string `arg:"positional,required" help:"Services to configure as a job."`
+	Services []string `arg:"positional,required" help:"Services to configure as a cron job."`
 	Cron     string   `arg:"--cron" help:"Cron schedule." default:"* * * * *"`
 }
 
 func (args *CodeCronArgs) Run() {
-	deployProject, composeFile, err := loadProject(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to load compose file: %s", composeFile))
-
-	for _, service := range args.Services {
-		composeEnsureDeploy(deployProject, service)
-		err = addComposeCronDeploy(deployProject, service, args.Cron)
-		checkErrorPanic(err, fmt.Sprintf("❌ Failed to update compose file: %s", composeFile))
+	rt, err := runtime.NewCodeCronRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create code cron runtime", err)
+		return
 	}
 
-	composeFile, err = saveProject(args.Env, deployProject)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to write compose file: %s", composeFile))
-	fmt.Println("✅ ", composeFile)
+	file, err := rt.UseCase.Configure(args.Env, args.Services, args.Cron, args.Verbose)
+	if err != nil {
+		logger.PanicErr("Failed to configure cron", err)
+		return
+	}
 
+	logger.Info("Updated deploy file: " + file)
 }

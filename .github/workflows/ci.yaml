@@ -6,75 +6,75 @@ on:
     paths:
       - 'minipaas-cli/**'
       - 'minipaas-role/**'
-      - 'minipaas-sql/**'
+      - 'docs/**'
+      - 'mk/**'
+      - 'Makefile'
       - '.github/workflows/**'
     branches:
       - main
   workflow_dispatch:
 
 env:
-  GO_VERSION: '1.24'
-  PY_VERSION: '3.14'
+  GO_VERSION: '1.25'
+  HUGO_VERSION: '0.154.3'
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15
-        ports:
-          - 5432:5432
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd="pg_isready"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: minipaas-cli/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13
+          working-directory: minipaas-cli
+
+      - name: Check import rules
+        run: make imports
+        working-directory: minipaas-cli
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: minipaas-cli/go.sum
 
       - name: Install dependencies
         run: go mod tidy
         working-directory: minipaas-cli
 
       - name: Run Go tests
-        run: go test ./... -v
+        run: make test
         working-directory: minipaas-cli
-
-      - name: Install PostgreSQL client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
-
-      - name: Validate SQL files
-        run: |
-          for f in minipaas-sql/*.sql; do
-            echo "⏳ Validating $f ..."
-            psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f "$f"
-          done
-        env:
-          PGPASSWORD: postgres
 
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          python-version: ${{ env.PY_VERSION }}
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: docs/go.sum
 
-      - name: Install system dependencies for Pillow
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libjpeg-dev zlib1g-dev libpng-dev libfreetype6-dev
+      - name: Set up Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
 
-      - name: Validate docs
+      - name: Build docs
         run: make build-docs

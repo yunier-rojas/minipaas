@@ -19,7 +19,7 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     image: postgres:17.4
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password
@@ -30,7 +30,7 @@ services:
         volume: {}
 volumes:
   postgres_data:
-    name: minipaas_postgres_data
+    name: sample_postgres_data
 secrets:
   postgres_password.267da420:
     external: true

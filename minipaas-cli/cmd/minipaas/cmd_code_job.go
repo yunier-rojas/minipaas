@@ -1,7 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type CodeJobArgs struct {
@@ -10,16 +11,17 @@ type CodeJobArgs struct {
 }
 
 func (args *CodeJobArgs) Run() {
-	deployProject, composeFile, err := loadProject(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to load compose file: %s", composeFile))
-
-	for _, service := range args.Services {
-		err = addComposeJobDeploy(deployProject, service)
-		checkErrorPanic(err, fmt.Sprintf("❌ Failed to update compose file: %s", composeFile))
+	rt, err := runtime.NewCodeJobRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create code job runtime", err)
+		return
 	}
 
-	composeFile, err = saveProject(args.Env, deployProject)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to write compose file: %s", composeFile))
-	fmt.Println("✅ ", composeFile)
+	file, err := rt.UseCase.Configure(args.Env, args.Services, args.Verbose)
+	if err != nil {
+		logger.PanicErr("Failed to configure job", err)
+		return
+	}
 
+	logger.Info("Updated deploy file: " + file)
 }

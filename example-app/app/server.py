@@ -2,8 +2,11 @@
 import http.server
 import json
 import logging
+from datetime import date, datetime, time as time_of_day, timedelta
+from decimal import Decimal
 
-import psycopg2
+import pgque
+import psycopg
 
 # Inline database configuration.
 DB_HOST = "postgres"
@@ -11,6 +14,14 @@ DB_USER = "postgres"
 DB_NAME = "postgres"
 SSL_MODE = "disable"
 SECRET_FILE = "/run/secrets/postgres_password"
+
+# PgQue queue names, consumers and event types.
+QUEUE_NAME = "example_queue"
+QUEUE_CONSUMER = "example-worker"
+QUEUE_EVENT_TYPE = "task"
+STREAM_NAME = "example_stream"
+STREAM_CONSUMER = "example-consumer"
+STREAM_EVENT_TYPE = "event"
 
 # Read the password from the secret file.
 try:
@@ -20,10 +31,54 @@ except Exception as e:
     raise Exception("Error reading secret file: " + str(e))
 
 # Build the connection string inline.
-DB_CONN_STR = f"host={DB_HOST} user={DB_USER} password={DB_PASSWORD} dbname={DB_NAME} sslmode={SSL_MODE}"
+DB_CONN_STR = (
+    f"host={DB_HOST} user={DB_USER} password={DB_PASSWORD} "
+    f"dbname={DB_NAME} sslmode={SSL_MODE}"
+)
 
-def get_connection():
-    return psycopg2.connect(DB_CONN_STR)
+
+def jsonable(value):
+    if isinstance(value, (datetime, date, time_of_day)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    return value
+
+
+def query(sql, params=None):
+    """Run a single statement and return rows as JSON-friendly dicts."""
+    with psycopg.connect(DB_CONN_STR, autocommit=True) as conn:
+        cur = conn.execute(sql, params or ())
+        if cur.description is None:
+            return []
+        columns = [desc.name for desc in cur.description]
+        return [
+            {name: jsonable(value) for name, value in zip(columns, row)}
+            for row in cur.fetchall()
+        ]
+
+
+def publish(queue, event_type, payload):
+    """Send one event to a PgQue queue and return its event id."""
+    with pgque.connect(DB_CONN_STR, autocommit=True) as client:
+        return client.send(queue, payload, type=event_type)
+
+
+def queue_info(queue):
+    return query("SELECT * FROM pgque.get_queue_info(%s);", (queue,))
+
+
+def consumer_info(queue=None):
+    if queue is None:
+        return query("SELECT * FROM pgque.get_consumer_info();")
+    return query("SELECT * FROM pgque.get_consumer_info(%s);", (queue,))
+
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
 
@@ -53,33 +108,33 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Resource not found")
 
-    # ----- /records Handlers -----
-    def handle_records_get(self):
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id, data FROM records;")
-            rows = cur.fetchall()
-            records = [{"id": r[0], "data": r[1]} for r in rows]
-            cur.close()
-            conn.close()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            response_json = json.dumps({"records": records})
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
-        except Exception as e:
-            self.send_error(500, str(e))
+    def send_json(self, payload, status=200):
+        response_json = json.dumps(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_json)))
+        self.end_headers()
+        self.wfile.write(response_json.encode("utf-8"))
 
-    def handle_records_post(self):
+    def read_json(self):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
         except ValueError:
             content_length = 0
         body = self.rfile.read(content_length).decode("utf-8")
+        return json.loads(body)
+
+    # ----- /records Handlers -----
+    def handle_records_get(self):
         try:
-            payload = json.loads(body)
+            records = query("SELECT id, data FROM records ORDER BY id;")
+            self.send_json({"records": records})
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_records_post(self):
+        try:
+            payload = self.read_json()
         except Exception:
             self.send_error(400, "Invalid JSON")
             return
@@ -87,48 +142,82 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, "Missing 'data' field")
             return
         try:
-            conn = get_connection()
-            cur = conn.cursor()
-            data = payload["data"]
-            cur.execute("INSERT INTO records (data) VALUES (%s) RETURNING id;", (data,))
-            new_id = cur.fetchone()[0]
-            conn.commit()
-            cur.close()
-            conn.close()
-            response = {"id": new_id, "data": data}
-            response_json = json.dumps(response)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
+            rows = query(
+                "INSERT INTO records (data) VALUES (%s) RETURNING id, data;",
+                (payload["data"],),
+            )
+            self.send_json(rows[0])
         except Exception as e:
             self.send_error(500, str(e))
 
-    # ----- /requests Handlers (Queue) -----
+    # ----- /queue Handlers -----
     def handle_queue_get(self):
         try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id, payload, status, created_at, processed_at FROM example_queue ORDER BY id;")
-            rows = cur.fetchall()
-            queue = []
-            for row in rows:
-                queue.append({
-                    "id": row[0],
-                    "payload": row[1],
-                    "status": row[2],
-                    "created_at": row[3].isoformat() if row[3] else None,
-                    "processed_at": row[4].isoformat() if row[4] else None,
-                })
-            cur.close()
-            conn.close()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            response_json = json.dumps({"queue": queue})
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
+            self.send_json({
+                "queue": queue_info(QUEUE_NAME),
+                "consumers": consumer_info(QUEUE_NAME),
+            })
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_queue_post(self):
+        try:
+            payload = self.read_json()
+        except Exception:
+            self.send_error(400, "Invalid JSON")
+            return
+        if "payload" not in payload:
+            self.send_error(400, "Missing 'payload' field")
+            return
+        try:
+            event_id = publish(QUEUE_NAME, QUEUE_EVENT_TYPE, payload["payload"])
+            self.send_json({
+                "id": event_id,
+                "queue": QUEUE_NAME,
+                "type": QUEUE_EVENT_TYPE,
+                "payload": payload["payload"],
+            })
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    # ----- /stream Handlers -----
+    def handle_stream_get(self):
+        try:
+            self.send_json({
+                "stream": queue_info(STREAM_NAME),
+                "consumers": consumer_info(STREAM_NAME),
+            })
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_stream_post(self):
+        try:
+            payload = self.read_json()
+        except Exception:
+            self.send_error(400, "Invalid JSON")
+            return
+        if "event" not in payload:
+            self.send_error(400, "Missing 'event' field")
+            return
+        try:
+            event_id = publish(STREAM_NAME, STREAM_EVENT_TYPE, payload["event"])
+            self.send_json({
+                "id": event_id,
+                "queue": STREAM_NAME,
+                "type": STREAM_EVENT_TYPE,
+                "payload": payload["event"],
+            })
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    # ----- /consumers Handlers -----
+    def handle_consumers_get(self):
+        try:
+            self.send_json({
+                "queue_consumer": QUEUE_CONSUMER,
+                "stream_consumer": STREAM_CONSUMER,
+                "consumers": consumer_info(),
+            })
         except Exception as e:
             self.send_error(500, str(e))
 
@@ -141,86 +230,6 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
-    def handle_queue_post(self):
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            content_length = 0
-        body = self.rfile.read(content_length).decode("utf-8")
-        try:
-            payload = json.loads(body)
-        except Exception:
-            self.send_error(400, "Invalid JSON")
-            return
-        if "payload" not in payload:
-            self.send_error(400, "Missing 'payload' field")
-            return
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            data = payload["payload"]
-            cur.execute("SELECT * FROM minipaas_queue_enqueue('example_queue', %s);", (json.dumps(data),))
-            row = cur.fetchone()
-            conn.commit()
-            cur.close()
-            conn.close()
-            response = {
-                "id": row[0],
-                "payload": row[1],
-                "status": row[2],
-                "created_at": row[3].isoformat() if row[3] else None,
-            }
-            response_json = json.dumps(response)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    # ----- /streams Handlers -----
-    def handle_stream_post(self):
-        # Add a new event into the stream (minipaas_stream_event table)
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            content_length = 0
-        body = self.rfile.read(content_length).decode("utf-8")
-        try:
-            payload = json.loads(body)
-        except Exception:
-            self.send_error(400, "Invalid JSON")
-            return
-        if "event" not in payload:
-            self.send_error(400, "Missing 'event' field")
-            return
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT * FROM minipaas_stream_publish('example_stream', %s);",
-                (json.dumps(payload["event"]),)
-            )
-            row = cur.fetchone()
-            conn.commit()
-            cur.close()
-            conn.close()
-            response = {
-                "id": row[0],
-                "payload": row[1],
-                "created_at": row[2].isoformat() if row[2] else None,
-            }
-            response_json = json.dumps(response)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    # ----- /streams Handlers -----
     def handle_error_post(self):
         try:
             code = int(self.path.split("/")[-1])
@@ -236,65 +245,16 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
-    def handle_stream_get(self):
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id, payload, created_at FROM example_stream ORDER BY id;")
-            rows = cur.fetchall()
-            queue = []
-            for row in rows:
-                queue.append({
-                    "id": row[0],
-                    "payload": row[1],
-                    "created_at": row[2].isoformat() if row[2] else None,
-                })
-            cur.close()
-            conn.close()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            response_json = json.dumps({"stream": queue})
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    def handle_consumers_get(self):
-        # Check consumer status from the consumer index table.
-        try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM consumer;")
-            rows = cur.fetchall()
-            consumers = []
-            for row in rows:
-                consumers.append({
-                    "id": row[0],
-                    "last_event_id": row[1],
-                    "updated_at": row[2].isoformat() if row[2] else None,
-                })
-            cur.close()
-            conn.close()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            response_json = json.dumps({"consumers": consumers})
-            self.send_header("Content-Length", str(len(response_json)))
-            self.end_headers()
-            self.wfile.write(response_json.encode("utf-8"))
-        except Exception as e:
-            self.send_error(500, str(e))
 
 if __name__ == '__main__':
     port = 8080
     server_address = ("", port)
     try:
-        conn = get_connection()
+        conn = psycopg.connect(DB_CONN_STR, autocommit=True)
         conn.close()
-        print("✅ Database connection successful.")
+        print("Database connection successful.")
     except Exception as e:
-        print("❌ Database connection failed:", e)
-        exit(1)
+        print("Database not ready yet, starting anyway:", e)
     print(f"Starting server on port {port}...")
     httpd = http.server.HTTPServer(server_address, RequestHandler)
     httpd.serve_forever()

@@ -23,9 +23,12 @@ services:
       interval: 10s
       retries: 5
       start_period: 10s
-    image: registry:5000/example:${MINIPAAS_DEPLOY_VERSION}
+    image: example:${MINIPAAS_DEPLOY_VERSION}
+    labels:
+      alert.cpu_threshold: "90"
+      alert.memory_threshold: 1000MiB
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password
@@ -45,9 +48,12 @@ services:
       restart_policy:
         condition: any
         delay: 10s
-    image: registry:5000/example:${MINIPAAS_DEPLOY_VERSION}
+    image: example:${MINIPAAS_DEPLOY_VERSION}
+    labels:
+      alert.cpu_threshold: "90"
+      alert.memory_threshold: 1000MiB
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password
@@ -61,9 +67,12 @@ services:
         swarm.cronjob.skip-running: "true"
       restart_policy:
         condition: none
-    image: registry:5000/example:${MINIPAAS_DEPLOY_VERSION}
+    image: example:${MINIPAAS_DEPLOY_VERSION}
+    labels:
+      alert.cpu_threshold: "90"
+      alert.memory_threshold: 1000MiB
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password
@@ -80,9 +89,12 @@ services:
         condition: on-failure
         delay: 10s
         max_attempts: 10
-    image: registry:5000/example-migration:${MINIPAAS_DEPLOY_VERSION}
+    image: example-migration:${MINIPAAS_DEPLOY_VERSION}
+    labels:
+      alert.cpu_threshold: "90"
+      alert.memory_threshold: 1000MiB
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password
@@ -102,9 +114,12 @@ services:
       restart_policy:
         condition: any
         delay: 10s
-    image: registry:5000/example:${MINIPAAS_DEPLOY_VERSION}
+    image: example:${MINIPAAS_DEPLOY_VERSION}
+    labels:
+      alert.cpu_threshold: "90"
+      alert.memory_threshold: 1000MiB
     networks:
-      minipaas_network: {}
+      sample_network: {}
     secrets:
       - source: postgres_password.267da420
         target: postgres_password

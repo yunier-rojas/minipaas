@@ -1,0 +1,91 @@
+imports-checks:
+  - folder: cmd/minipaas
+    rules:
+      - allow:
+          # stdlib
+          - fmt
+
+          # 3rd party
+          - github.com/alexflint/go-arg
+
+          # minipaas
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger
+
+  - folder: internal/core/entities
+    exclude:
+      - ".*_test\\.go"
+    rules:
+      - allow:
+          # stdlib
+          - fmt
+          - strings
+
+  - folder: internal/core/usecases
+    exclude:
+      - ".*_test\\.go"
+    rules:
+      - allow:
+          # stdlib
+          - fmt
+          - sort
+          - strings
+          - path/filepath
+          - crypto/sha256
+          - encoding/hex
+
+          # 3rd party
+          - github.com/cockroachdb/errors
+
+          # minipaas
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/core/entities
+
+  - folder: internal/frameworks/*
+    exclude:
+      - ".*_test\\.go"
+    rules:
+      - allow:
+          # stdlib
+          - fmt
+          - strings
+          - bufio
+          - net
+          - net/url
+          - os
+          - os/exec
+          - path/filepath
+          - regexp
+          - sort
+          - sync
+          - bytes
+          - context
+          - time
+          - io
+          - text/template
+          - encoding/json
+          - strconv
+          - embed
+
+          # 3rd party
+          - github.com/compose-spec/compose-go/v2
+          - github.com/compose-spec/compose-go/v2/*
+          - github.com/cockroachdb/errors
+          - gopkg.in/yaml.v3
+
+          # minipaas
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/core/entities
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/core/usecases
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/process
+
+  - folder: internal/runtime
+    exclude:
+      - ".*_test\\.go"
+    rules:
+      - allow:
+          # 3rd party
+          - go.uber.org/dig
+
+          # minipaas
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/core/usecases
+          - github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/*

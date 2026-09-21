@@ -1,44 +1,25 @@
 package main
 
 import (
-	"errors"
 	"github.com/alexflint/go-arg"
-	"log"
+
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
 )
 
-/***********
-COMMANDS
-************/
-
 var args struct {
-	CertsSubcommand  *CertsSubcommand  `arg:"subcommand:certs"`
 	CodeSubcommand   *CodeSubcommand   `arg:"subcommand:code"`
-	SecretSubcommand *SecretSubcommand `arg:"subcommand:secret"`
-	ConfigSubcommand *ConfigSubcommand `arg:"subcommand:config"`
 	DeploySubcommand *DeploySubcommand `arg:"subcommand:deploy"`
 
 	Shell *ShellArgs `arg:"subcommand:shell"`
 }
 
-/***********
-CONFIG
-************/
-
 func main() {
+	logger.Init()
 	arg.MustParse(&args)
 
 	switch {
-	case args.CertsSubcommand != nil:
-		args.CertsSubcommand.Run()
-
 	case args.CodeSubcommand != nil:
 		args.CodeSubcommand.Run()
-
-	case args.SecretSubcommand != nil:
-		args.SecretSubcommand.Run()
-
-	case args.ConfigSubcommand != nil:
-		args.ConfigSubcommand.Run()
 
 	case args.DeploySubcommand != nil:
 		args.DeploySubcommand.Run()
@@ -46,6 +27,6 @@ func main() {
 	case args.Shell != nil:
 		args.Shell.Run()
 	default:
-		log.Fatal(errors.New("command not supported"))
+		logger.Panic("command not supported")
 	}
 }

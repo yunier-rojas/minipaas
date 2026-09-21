@@ -1,13 +1,7 @@
 ---
-# Docker
-docker_tls_dir: ".certs"
-
-# Swarm tools
 swarm_cronjob_version: "1.14.0"
 
-# Telegram
 telegram_bot_token: "{{ lookup('env', 'TELEGRAM_TOKEN') }}"
 telegram_chat_id: "{{ lookup('env', 'TELEGRAM_CHAT') }}"
 
-# Firewall
 minipaas_extra_ports: []

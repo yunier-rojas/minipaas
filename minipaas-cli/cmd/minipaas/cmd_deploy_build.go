@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"
-	"path/filepath"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type DeployBuildArgs struct {
@@ -10,23 +10,14 @@ type DeployBuildArgs struct {
 }
 
 func (args *DeployBuildArgs) Run() {
-	cfg, configFile, err := loadConfig(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Error loading configuration file: %s", configFile))
-	setApiEnvVars(args.Env, cfg, args.Verbose)
+	rt, err := runtime.NewDeployBuildRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create deploy build runtime", err)
+		return
+	}
 
-	project, err := composeLoadDeployProject(append(cfg.Project.Files, filepath.Join(args.Env, appsFile)))
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to load project files: %s", cfg.Project.Files))
-
-	for name, svc := range project.Services {
-		if svc.Build == nil {
-			continue
-		}
-		buildArgs := buildCommandFromService(svc)
-		err = runCommand(buildArgs, args.Verbose)
-		if err != nil {
-			fmt.Printf("❌ %s: %s\n", name, err.Error())
-		} else {
-			fmt.Printf("✅ %s: %s\n", name, cfg.Deploy.Version)
-		}
+	if err = rt.UseCase.Build(args.Env, args.Verbose); err != nil {
+		logger.PanicErr("Failed to build services", err)
+		return
 	}
 }

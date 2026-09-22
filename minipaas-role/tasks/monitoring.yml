@@ -36,7 +36,7 @@
 
 - name: Download the system monitoring script from URL
   ansible.builtin.get_url:
-    url: "https://raw.githubusercontent.com/sombrahq/telegram-bash-system-monitoring/refs/tags/v4.1.0/system-monitoring.sh"
+    url: "https://raw.githubusercontent.com/yunier-rojas/telegram-bash-system-monitoring/main/system-monitoring.sh"
     dest: "{{ monitor_script }}"
     owner: root
     group: root

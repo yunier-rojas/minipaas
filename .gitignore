@@ -6,3 +6,8 @@ var
 .gopath/
 .cache
 coverage.out
+
+.hugo_build.lock
+docs/public
+docs/resources
+

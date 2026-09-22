@@ -1,0 +1,7047 @@
+-- migrate:up
+-- pgque.sql -- PgQ Universal Edition
+-- Version: 0.2.0
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+-- Includes code derived from PgQ (ISC license, Marko Kreen / Skype Technologies OU).
+--
+-- Install: \i pgque.sql
+-- Start:   SELECT pgque.start();
+-- Usage:   See https://github.com/NikolayS/pgque
+
+create schema if not exists pgque;
+
+-- ======================================================================
+-- Section 1: Tables (derived from PgQ)
+-- Origin: pgq/structure/tables.sql
+--
+-- PgQue transformations applied:
+--   1. Schema rename: pgq → pgque (all identifiers, grants, references)
+--   2. txid_current() → pg_current_xact_id()::text::bigint (PG14+ API)
+--   3. txid_snapshot → pg_snapshot (type rename)
+--   4. ev_txid kept as xid8 (required by pg_visible_in_snapshot)
+--   5. queue_per_tx_limit column removed (not supported without C)
+--   6. set default_with_oids removed (deprecated since PG 12)
+--   7. CREATE TABLE → CREATE TABLE IF NOT EXISTS (idempotent install)
+-- ======================================================================
+
+-- ----------------------------------------------------------------------
+-- Section: Internal Tables
+--
+-- Overview:
+--      pgque.queue                   - Queue configuration
+--      pgque.consumer                - Consumer names
+--      pgque.subscription            - Consumer registrations
+--      pgque.tick                    - Per-queue snapshots (ticks)
+--      pgque.event_*                 - Data tables
+--      pgque.retry_queue             - Events to be retried later
+--
+-- 
+-- Standard triggers store events in the pgque.event_* data tables
+-- There is one top event table pgque.event_<queue_id> for each queue
+-- inherited from pgque.event_template wuith three tables for actual data
+-- pgque.event_<queue_id>_0 to pgque.event_<queue_id>_2.
+--
+-- The active table is rotated at interval, so that if all the consubers
+-- have passed some poin the oldes one can be emptied using TRUNCATE command
+-- for efficiency
+-- 
+-- 
+-- ----------------------------------------------------------------------
+
+
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.consumer
+--
+--      Name to id lookup for consumers
+--
+-- Columns:
+--      co_id       - consumer's id for internal usage
+--      co_name     - consumer's id for external usage
+-- ----------------------------------------------------------------------
+create table if not exists pgque.consumer (
+        co_id       serial,
+        co_name     text        not null,
+
+        constraint consumer_pkey primary key (co_id),
+        constraint consumer_name_uq UNIQUE (co_name)
+);
+
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.queue
+--
+--     Information about available queues
+--
+-- Columns:
+--      queue_id                    - queue id for internal usage
+--      queue_name                  - queue name visible outside
+--      queue_ntables               - how many data tables the queue has
+--      queue_cur_table             - which data table is currently active
+--      queue_rotation_period       - period for data table rotation
+--      queue_switch_step1          - tx when rotation happened
+--      queue_switch_step2          - tx after rotation was committed
+--      queue_switch_time           - time when switch happened
+--      queue_external_ticker       - ticks come from some external sources
+--      queue_ticker_paused         - ticker is paused
+--      queue_disable_insert        - disallow pgque.insert_event()
+--      queue_ticker_max_count      - batch should not contain more events
+--      queue_ticker_max_lag        - events should not age more
+--      queue_ticker_idle_period    - how often to tick when no events happen
+--      queue_data_pfx              - prefix for data table names
+--      queue_event_seq             - sequence for event id's
+--      queue_tick_seq              - sequence for tick id's
+--      queue_extra_maint           - array of functon names to call during maintenance
+-- ----------------------------------------------------------------------
+create table if not exists pgque.queue (
+        queue_id                    serial,
+        queue_name                  text        not null,
+
+        queue_ntables               integer     not null default 3,
+        queue_cur_table             integer     not null default 0,
+        queue_rotation_period       interval    not null default '2 hours',
+        queue_switch_step1          bigint      not null default pg_current_xact_id()::text::bigint, -- PgQue transformation: txid_current()→pg_current_xact_id()::text::bigint (PG14+)
+        queue_switch_step2          bigint               default pg_current_xact_id()::text::bigint,
+        queue_switch_time           timestamptz not null default now(),
+
+        queue_external_ticker       boolean     not null default false,
+        queue_disable_insert        boolean     not null default false,
+        queue_ticker_paused         boolean     not null default false,
+
+        queue_ticker_max_count      integer     not null default 500,
+        queue_ticker_max_lag        interval    not null default '3 seconds',
+        queue_ticker_idle_period    interval    not null default '1 minute',
+
+        queue_data_pfx              text        not null,
+        queue_event_seq             text        not null,
+        queue_tick_seq              text        not null,
+
+        queue_extra_maint           text[],
+
+        constraint queue_pkey primary key (queue_id),
+        constraint queue_name_uq unique (queue_name)
+);
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.tick
+--
+--      Snapshots for event batching
+--
+-- Columns:
+--      tick_queue      - queue id whose tick it is
+--      tick_id         - ticks id (per-queue)
+--      tick_time       - time when tick happened
+--      tick_snapshot   - transaction state
+--      tick_event_seq  - last value for event seq
+-- ----------------------------------------------------------------------
+create table if not exists pgque.tick (
+        tick_queue                  int4            not null,
+        tick_id                     bigint          not null,
+        tick_time                   timestamptz     not null default now(),
+        tick_snapshot               pg_snapshot   not null default pg_current_snapshot(),
+        tick_event_seq              bigint          not null, -- may be NULL on upgraded dbs
+
+        constraint tick_pkey primary key (tick_queue, tick_id),
+        constraint tick_queue_fkey foreign key (tick_queue)
+                                   references pgque.queue (queue_id)
+);
+
+-- ----------------------------------------------------------------------
+-- Sequence: pgque.batch_id_seq
+--
+--      Sequence for batch id's.
+-- ----------------------------------------------------------------------
+create sequence if not exists pgque.batch_id_seq;
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.subscription
+--
+--      Consumer registration on a queue.
+--
+-- Columns:
+--
+--      sub_id          - subscription id for internal usage
+--      sub_queue       - queue id
+--      sub_consumer    - consumer's id
+--      sub_last_tick   - last tick the consumer processed
+--      sub_batch       - shortcut for queue_id/consumer_id/tick_id
+--      sub_next_tick   - batch end pos
+-- ----------------------------------------------------------------------
+create table if not exists pgque.subscription (
+        sub_id                          serial      not null,
+        sub_queue                       int4        not null,
+        sub_consumer                    int4        not null,
+        sub_last_tick                   bigint,
+        sub_active                      timestamptz not null default now(),
+        sub_batch                       bigint,
+        sub_next_tick                   bigint,
+
+        constraint subscription_pkey primary key (sub_queue, sub_consumer),
+        constraint subscription_batch_idx unique (sub_batch),
+        constraint sub_queue_fkey foreign key (sub_queue)
+                                   references pgque.queue (queue_id),
+        constraint sub_consumer_fkey foreign key (sub_consumer)
+                                   references pgque.consumer (co_id)
+);
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.event_template
+--
+--      Parent table for all event tables
+--
+-- Columns:
+--      ev_id               - event's id, supposed to be unique per queue
+--      ev_time             - when the event was inserted
+--      ev_txid             - transaction id which inserted the event
+--      ev_owner            - subscription id that wanted to retry this
+--      ev_retry            - how many times the event has been retried, NULL for new events
+--      ev_type             - consumer/producer can specify what the data fields contain
+--      ev_data             - data field
+--      ev_extra1           - extra data field
+--      ev_extra2           - extra data field
+--      ev_extra3           - extra data field
+--      ev_extra4           - extra data field
+-- ----------------------------------------------------------------------
+create table if not exists pgque.event_template (
+        ev_id               bigint          not null,
+        ev_time             timestamptz     not null,
+
+        ev_txid             xid8          not null default pg_current_xact_id(), -- PgQue transformation: bigint→xid8 (needed for pg_visible_in_snapshot)
+        ev_owner            int4,
+        ev_retry            int4,
+
+        ev_type             text,
+        ev_data             text,
+        ev_extra1           text,
+        ev_extra2           text,
+        ev_extra3           text,
+        ev_extra4           text
+);
+
+-- ----------------------------------------------------------------------
+-- Table: pgque.retry_queue
+--
+--      Events to be retried.  When retry time reaches, they will
+--      be put back into main queue.
+--
+-- Columns:
+--      ev_retry_after          - time when it should be re-inserted to main queue
+--      ev_queue                - queue id, used to speed up event copy into queue
+--      *                       - same as pgque.event_template
+-- ----------------------------------------------------------------------
+create table if not exists pgque.retry_queue (
+    ev_retry_after          timestamptz     not null,
+    ev_queue                int4            not null,
+
+    like pgque.event_template,
+
+    constraint rq_pkey primary key (ev_owner, ev_id),
+    constraint rq_queue_id_fkey foreign key (ev_queue)
+                             references pgque.queue (queue_id)
+);
+alter table pgque.retry_queue alter column ev_owner set not null;
+alter table pgque.retry_queue alter column ev_txid drop not null;
+create index if not exists rq_retry_idx on pgque.retry_queue (ev_retry_after);
+
+-- ======================================================================
+-- Section 2: Internal functions (derived from PgQ)
+-- Origin: pgq/functions/*.sql
+--
+-- PgQue transformations applied:
+--   1. Schema rename: pgq → pgque
+--   2. txid_* → pg_* function renames (PG14+ snapshot API)
+--   3. pg_snapshot_xmin/xmax wrapped with ::text::bigint (xid8→bigint)
+--   4. pg_current_xact_id() cast to ::text::bigint (xid8→bigint)
+--   5. SECURITY DEFINER functions get SET search_path = pgque, pg_catalog
+--   6. pgq_node/Londiste hooks removed from maint_operations
+--   7. pg_notify() injected into ticker for LISTEN/NOTIFY wakeup
+--   8. create_queue() rejects queue names > 57 bytes (pg_notify limit)
+-- ======================================================================
+
+
+create or replace function pgque.upgrade_schema()
+returns int4 as $$
+-- updates table structure if necessary
+declare
+    cnt int4 = 0;
+begin
+
+    -- pgque.subscription.sub_last_tick: NOT NULL -> NULL
+    perform 1 from information_schema.columns
+      where table_schema = 'pgque'
+        and table_name = 'subscription'
+        and column_name ='sub_last_tick'
+        and is_nullable = 'NO';
+    if found then
+        alter table pgque.subscription
+            alter column sub_last_tick
+            drop not null;
+        cnt := cnt + 1;
+    end if;
+
+    -- create roles
+    perform 1 from pg_catalog.pg_roles where rolname = 'pgque_reader';
+    if not found then
+        create role pgque_reader;
+        cnt := cnt + 1;
+    end if;
+    perform 1 from pg_catalog.pg_roles where rolname = 'pgque_writer';
+    if not found then
+        create role pgque_writer;
+        cnt := cnt + 1;
+    end if;
+    perform 1 from pg_catalog.pg_roles where rolname = 'pgque_admin';
+    if not found then
+        create role pgque_admin;
+        grant pgque_reader to pgque_admin;
+        grant pgque_writer to pgque_admin;
+        cnt := cnt + 1;
+    end if;
+
+    perform 1 from pg_attribute
+        where attrelid = 'pgque.queue'::regclass
+          and attname = 'queue_extra_maint';
+    if not found then
+        alter table pgque.queue add column queue_extra_maint text[];
+    end if;
+
+    return cnt;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.batch_event_sql(x_batch_id bigint)
+returns text as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.batch_event_sql(1)
+--      Creates SELECT statement that fetches events for this batch.
+--
+-- Parameters:
+--      x_batch_id    - ID of a active batch.
+--
+-- Returns:
+--      SQL statement.
+-- ----------------------------------------------------------------------
+
+-- ----------------------------------------------------------------------
+-- Algorithm description:
+--      Given 2 snapshots, sn1 and sn2 with sn1 having xmin1, xmax1
+--      and sn2 having xmin2, xmax2 create expression that filters
+--      right txid's from event table.
+--
+--      Simplest solution would be
+--      > WHERE ev_txid >= xmin1 AND ev_txid <= xmax2
+--      >   AND NOT pg_visible_in_snapshot(ev_txid, sn1)
+--      >   AND pg_visible_in_snapshot(ev_txid, sn2)
+--
+--      The simple solution has a problem with long transactions (xmin1 very low).
+--      All the batches that happen when the long tx is active will need
+--      to scan all events in that range.  Here is 2 optimizations used:
+--
+--      1)  Use [xmax1..xmax2] for range scan.  That limits the range to
+--      txids that actually happened between two snapshots.  For txids
+--      in the range [xmin1..xmax1] look which ones were actually
+--      committed between snapshots and search for them using exact
+--      values using IN (..) list.
+--
+--      2) As most TX are short, there could be lot of them that were
+--      just below xmax1, but were committed before xmax2.  So look
+--      if there are ID's near xmax1 and lower the range to include
+--      them, thus decresing size of IN (..) list.
+-- ----------------------------------------------------------------------
+declare
+    rec             record;
+    sql             text;
+    tbl             text;
+    arr             text;
+    part            text;
+    select_fields   text;
+    retry_expr      text;
+    batch           record;
+begin
+    select s.sub_last_tick, s.sub_next_tick, s.sub_id, s.sub_queue,
+           pg_snapshot_xmax(last.tick_snapshot)::text::bigint as tx_start,
+           pg_snapshot_xmax(cur.tick_snapshot)::text::bigint as tx_end,
+           last.tick_snapshot as last_snapshot,
+           cur.tick_snapshot as cur_snapshot
+        into batch
+        from pgque.subscription s, pgque.tick last, pgque.tick cur
+        where s.sub_batch = x_batch_id
+          and last.tick_queue = s.sub_queue
+          and last.tick_id = s.sub_last_tick
+          and cur.tick_queue = s.sub_queue
+          and cur.tick_id = s.sub_next_tick;
+    if not found then
+        raise exception 'batch not found';
+    end if;
+
+    -- load older transactions
+    arr := '';
+    for rec in
+        -- active tx-es in prev_snapshot that were committed in cur_snapshot
+        select id1 from
+            pg_snapshot_xip(batch.last_snapshot) id1 left join
+            pg_snapshot_xip(batch.cur_snapshot) id2 on (id1 = id2)
+        where id2 is null
+        order by 1 desc
+    loop
+        -- try to avoid big IN expression, so try to include nearby
+        -- tx'es into range
+        if batch.tx_start - 100 <= rec.id1::text::bigint then
+            batch.tx_start := rec.id1::text::bigint;
+        else
+            if arr = '' then
+                arr := '''' || rec.id1::text || '''::xid8';
+            else
+                arr := arr || ',''' || rec.id1::text || '''::xid8';
+            end if;
+        end if;
+    end loop;
+
+    -- must match pgque.event_template
+    select_fields := 'select ev_id, ev_time, ev_txid, ev_retry, ev_type,'
+        || ' ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4';
+    retry_expr :=  ' and (ev_owner is null or ev_owner = '
+        || batch.sub_id::text || ')';
+
+    -- now generate query that goes over all potential tables
+    sql := '';
+    for rec in
+        select xtbl from pgque.batch_event_tables(x_batch_id) xtbl
+    loop
+        tbl := pgque.quote_fqname(rec.xtbl);
+        -- this gets newer queries that definitely are not in prev_snapshot
+        part := select_fields
+            || ' from pgque.tick cur, pgque.tick last, ' || tbl || ' ev '
+            || ' where cur.tick_id = ' || batch.sub_next_tick::text
+            || ' and cur.tick_queue = ' || batch.sub_queue::text
+            || ' and last.tick_id = ' || batch.sub_last_tick::text
+            || ' and last.tick_queue = ' || batch.sub_queue::text
+            || ' and ev.ev_txid >= ''' || batch.tx_start::text || '''::xid8'
+            || ' and ev.ev_txid <= ''' || batch.tx_end::text || '''::xid8'
+            || ' and pg_visible_in_snapshot(ev.ev_txid, cur.tick_snapshot)'
+            || ' and not pg_visible_in_snapshot(ev.ev_txid, last.tick_snapshot)'
+            || retry_expr;
+        -- now include older tx-es, that were ongoing
+        -- at the time of prev_snapshot
+        if arr <> '' then
+            part := part || ' union all '
+                || select_fields || ' from ' || tbl || ' ev '
+                || ' where ev.ev_txid in (' || arr || ')'
+                || retry_expr;
+        end if;
+        if sql = '' then
+            sql := part;
+        else
+            sql := sql || ' union all ' || part;
+        end if;
+    end loop;
+    if sql = '' then
+        raise exception 'could not construct sql for batch %', x_batch_id;
+    end if;
+    return sql || ' order by 1';
+end;
+$$ language plpgsql;  -- no perms needed
+
+create or replace function pgque.batch_event_tables(x_batch_id bigint)
+returns setof text as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.batch_event_tables(1)
+--
+--     Returns set of table names where this batch events may reside.
+--
+-- Parameters:
+--     x_batch_id    - ID of a active batch.
+-- ----------------------------------------------------------------------
+declare
+    nr                    integer;
+    tbl                   text;
+    use_prev              integer;
+    use_next              integer;
+    batch                 record;
+begin
+    select
+           pg_snapshot_xmin(last.tick_snapshot)::text::bigint as tx_min, -- absolute minimum
+           pg_snapshot_xmax(cur.tick_snapshot)::text::bigint as tx_max, -- absolute maximum
+           q.queue_data_pfx, q.queue_ntables,
+           q.queue_cur_table, q.queue_switch_step1, q.queue_switch_step2
+        into batch
+        from pgque.tick last, pgque.tick cur, pgque.subscription s, pgque.queue q
+        where cur.tick_id = s.sub_next_tick
+          and cur.tick_queue = s.sub_queue
+          and last.tick_id = s.sub_last_tick
+          and last.tick_queue = s.sub_queue
+          and s.sub_batch = x_batch_id
+          and q.queue_id = s.sub_queue;
+    if not found then
+        raise exception 'Cannot find data for batch %', x_batch_id;
+    end if;
+
+    -- if its definitely not in one or other, look into both
+    if batch.tx_max < batch.queue_switch_step1 then
+        use_prev := 1;
+        use_next := 0;
+    elsif batch.queue_switch_step2 is not null
+      and (batch.tx_min > batch.queue_switch_step2)
+    then
+        use_prev := 0;
+        use_next := 1;
+    else
+        use_prev := 1;
+        use_next := 1;
+    end if;
+
+    if use_prev then
+        nr := batch.queue_cur_table - 1;
+        if nr < 0 then
+            nr := batch.queue_ntables - 1;
+        end if;
+        tbl := batch.queue_data_pfx || '_' || nr::text;
+        return next tbl;
+    end if;
+
+    if use_next then
+        tbl := batch.queue_data_pfx || '_' || batch.queue_cur_table::text;
+        return next tbl;
+    end if;
+
+    return;
+end;
+$$ language plpgsql; -- no perms needed
+
+create or replace function pgque.event_retry_raw(
+    x_queue text,
+    x_consumer text,
+    x_retry_after timestamptz,
+    x_ev_id bigint,
+    x_ev_time timestamptz,
+    x_ev_retry integer,
+    x_ev_type text,
+    x_ev_data text,
+    x_ev_extra1 text,
+    x_ev_extra2 text,
+    x_ev_extra3 text,
+    x_ev_extra4 text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.event_retry_raw(12)
+--
+--      Allows full control over what goes to retry queue.
+--
+-- Parameters:
+--      x_queue         - name of the queue
+--      x_consumer      - name of the consumer
+--      x_retry_after   - when the event should be processed again
+--      x_ev_id         - event id
+--      x_ev_time       - creation time
+--      x_ev_retry      - retry count
+--      x_ev_type       - user data
+--      x_ev_data       - user data
+--      x_ev_extra1     - user data
+--      x_ev_extra2     - user data
+--      x_ev_extra3     - user data
+--      x_ev_extra4     - user data
+--
+-- Returns:
+--      Event ID.
+-- ----------------------------------------------------------------------
+declare
+    q record;
+    id bigint;
+begin
+    select sub_id, queue_event_seq, sub_queue into q
+      from pgque.consumer, pgque.queue, pgque.subscription
+     where queue_name = x_queue
+       and co_name = x_consumer
+       and sub_consumer = co_id
+       and sub_queue = queue_id;
+    if not found then
+        raise exception 'consumer not registered';
+    end if;
+
+    id := x_ev_id;
+    if id is null then
+        id := nextval(q.queue_event_seq);
+    end if;
+
+    insert into pgque.retry_queue (ev_retry_after, ev_queue,
+            ev_id, ev_time, ev_owner, ev_retry,
+            ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4)
+    values (x_retry_after, q.sub_queue,
+            id, x_ev_time, q.sub_id, x_ev_retry,
+            x_ev_type, x_ev_data, x_ev_extra1, x_ev_extra2,
+            x_ev_extra3, x_ev_extra4);
+
+    return id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog; -- PgQue transformation: pin search_path (SECURITY DEFINER hardening)
+
+create or replace function pgque.find_tick_helper(
+    in i_queue_id int4,
+    in i_prev_tick_id int8,
+    in i_prev_tick_time timestamptz,
+    in i_prev_tick_seq int8,
+    in i_min_count int8,
+    in i_min_interval interval,
+    out next_tick_id int8,
+    out next_tick_time timestamptz,
+    out next_tick_seq int8)
+as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.find_tick_helper(6)
+--
+--      Helper function for pgque.next_batch_custom() to do extended tick search.
+-- ----------------------------------------------------------------------
+declare
+    sure    boolean;
+    can_set boolean;
+    t       record;
+    cnt     int8;
+    ival    interval;
+begin
+    -- first, fetch last tick of the queue
+    select tick_id, tick_time, tick_event_seq into t
+        from pgque.tick
+        where tick_queue = i_queue_id
+          and tick_id > i_prev_tick_id
+        order by tick_queue desc, tick_id desc
+        limit 1;
+    if not found then
+        return;
+    end if;
+    
+    -- check whether batch would end up within reasonable limits
+    sure := true;
+    can_set := false;
+    if i_min_count is not null then
+        cnt = t.tick_event_seq - i_prev_tick_seq;
+        if cnt >= i_min_count then
+            can_set := true;
+        end if;
+        if cnt > i_min_count * 2 then
+            sure := false;
+        end if;
+    end if;
+    if i_min_interval is not null then
+        ival = t.tick_time - i_prev_tick_time;
+        if ival >= i_min_interval then
+            can_set := true;
+        end if;
+        if ival > i_min_interval * 2 then
+            sure := false;
+        end if;
+    end if;
+
+    -- if last tick too far away, do large scan
+    if not sure then
+        select tick_id, tick_time, tick_event_seq into t
+            from pgque.tick
+            where tick_queue = i_queue_id
+              and tick_id > i_prev_tick_id
+              and ((i_min_count is not null and (tick_event_seq - i_prev_tick_seq) >= i_min_count)
+                  or
+                   (i_min_interval is not null and (tick_time - i_prev_tick_time) >= i_min_interval))
+            order by tick_queue asc, tick_id asc
+            limit 1;
+        can_set := true;
+    end if;
+    if can_set then
+        next_tick_id := t.tick_id;
+        next_tick_time := t.tick_time;
+        next_tick_seq := t.tick_event_seq;
+    end if;
+    return;
+end;
+$$ language plpgsql stable;
+
+create or replace function pgque.ticker(i_queue_name text, i_tick_id bigint, i_orig_timestamp timestamptz, i_event_seq bigint)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.ticker(3)
+--
+--     External ticker: Insert a tick with a particular tick_id and timestamp.
+--
+-- Parameters:
+--     i_queue_name     - Name of the queue
+--     i_tick_id        - Id of new tick.
+--
+-- Returns:
+--     Tick id.
+-- ----------------------------------------------------------------------
+begin
+    insert into pgque.tick (tick_queue, tick_id, tick_time, tick_event_seq)
+    select queue_id, i_tick_id, i_orig_timestamp, i_event_seq
+        from pgque.queue
+        where queue_name = i_queue_name
+          and queue_external_ticker
+          and not queue_ticker_paused;
+    if not found then
+        raise exception 'queue not found or ticker disabled: %', i_queue_name;
+    end if;
+
+    -- make sure seqs stay current
+    perform pgque.seq_setval(queue_tick_seq, i_tick_id),
+            pgque.seq_setval(queue_event_seq, i_event_seq)
+        from pgque.queue
+        where queue_name = i_queue_name;
+
+
+    -- pgque: notify listeners after tick
+    perform pg_notify('pgque_' || i_queue_name, i_tick_id::text); -- PgQue transformation: LISTEN/NOTIFY wakeup (not in original PgQ)
+    return i_tick_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.ticker(i_queue_name text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.ticker(1)
+--
+--     Check if tick is needed for the queue and insert it.
+--
+--     For pgqadm usage.
+--
+-- Parameters:
+--     i_queue_name     - Name of the queue
+--
+-- Returns:
+--     Tick id or NULL if no tick was done.
+-- ----------------------------------------------------------------------
+declare
+    res bigint;
+    q record;
+    state record;
+    last2 record;
+begin
+    select queue_id, queue_tick_seq, queue_external_ticker,
+            queue_ticker_max_count, queue_ticker_max_lag,
+            queue_ticker_idle_period, queue_event_seq,
+            pgque.seq_getval(queue_event_seq) as event_seq,
+            queue_ticker_paused
+        into q
+        from pgque.queue where queue_name = i_queue_name;
+    if not found then
+        raise exception 'no such queue';
+    end if;
+
+    if q.queue_external_ticker then
+        raise exception 'This queue has external tick source.';
+    end if;
+
+    if q.queue_ticker_paused then
+        raise exception 'Ticker has been paused for this queue';
+    end if;
+
+    -- load state from last tick
+    select now() - tick_time as lag,
+           q.event_seq - tick_event_seq as new_events,
+           tick_id, tick_time, tick_event_seq,
+           pg_snapshot_xmax(tick_snapshot)::text::bigint as sxmax,
+           pg_snapshot_xmin(tick_snapshot)::text::bigint as sxmin
+        into state
+        from pgque.tick
+        where tick_queue = q.queue_id
+        order by tick_queue desc, tick_id desc
+        limit 1;
+
+    if found then
+        if state.sxmin > pg_current_xact_id()::text::bigint then
+            raise exception 'Invalid PgQ state: old xmin=%, old xmax=%, cur txid=%',
+                            state.sxmin, state.sxmax, pg_current_xact_id()::text::bigint;
+        end if;
+        if state.new_events < 0 then
+            raise warning 'Negative new_events?  old=% cur=%', state.tick_event_seq, q.event_seq;
+        end if;
+        if state.sxmax > pg_current_xact_id()::text::bigint then
+            raise warning 'Dubious PgQ state: old xmax=%, cur txid=%', state.sxmax, pg_current_xact_id()::text::bigint;
+        end if;
+
+        if state.new_events > 0 then
+            -- there are new events, should we wait a bit?
+            if state.new_events < q.queue_ticker_max_count
+                and state.lag < q.queue_ticker_max_lag
+            then
+                return NULL;
+            end if;
+        else
+            -- no new events, should we apply idle period?
+            -- check previous event from the last one.
+            select state.tick_time - tick_time as lag
+                into last2
+                from pgque.tick
+                where tick_queue = q.queue_id
+                    and tick_id < state.tick_id
+                order by tick_queue desc, tick_id desc
+                limit 1;
+            if found then
+                -- gradually decrease the tick frequency
+                if (state.lag < q.queue_ticker_max_lag / 2)
+                    or
+                   (state.lag < last2.lag * 2
+                    and state.lag < q.queue_ticker_idle_period)
+                then
+                    return NULL;
+                end if;
+            end if;
+        end if;
+    end if;
+
+    insert into pgque.tick (tick_queue, tick_id, tick_event_seq)
+        values (q.queue_id, nextval(q.queue_tick_seq), q.event_seq);
+
+
+    -- pgque: notify listeners after tick
+    perform pg_notify('pgque_' || i_queue_name, currval(q.queue_tick_seq)::text); -- PgQue transformation: LISTEN/NOTIFY wakeup (not in original PgQ)
+    return currval(q.queue_tick_seq);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.ticker() returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.ticker(0)
+--
+--     Creates ticks for all unpaused queues which dont have external ticker.
+--
+-- Returns:
+--     Number of queues that were processed.
+-- ----------------------------------------------------------------------
+declare
+    res bigint;
+    q record;
+begin
+    res := 0;
+    for q in
+        select queue_name from pgque.queue
+            where not queue_external_ticker
+                  and not queue_ticker_paused
+            order by queue_name
+    loop
+        if pgque.ticker(q.queue_name) > 0 then
+            res := res + 1;
+        end if;
+    end loop;
+    return res;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.maint_retry_events()
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_retry_events(0)
+--
+--      Moves retry events back to main queue.
+--
+--      It moves small amount at a time.  It should be called
+--      until it returns 0
+--
+-- Returns:
+--      Number of events processed.
+-- ----------------------------------------------------------------------
+declare
+    cnt    integer;
+    rec    record;
+begin
+    cnt := 0;
+
+    -- allow only single event mover at a time, without affecting inserts
+    lock table pgque.retry_queue in share update exclusive mode;
+
+    for rec in
+        select queue_name,
+               ev_id, ev_time, ev_owner, ev_retry, ev_type, ev_data,
+               ev_extra1, ev_extra2, ev_extra3, ev_extra4
+          from pgque.retry_queue, pgque.queue
+         where ev_retry_after <= current_timestamp
+           and queue_id = ev_queue
+         order by ev_retry_after
+         limit 10
+    loop
+        cnt := cnt + 1;
+        perform pgque.insert_event_raw(rec.queue_name,
+                    rec.ev_id, rec.ev_time, rec.ev_owner, rec.ev_retry,
+                    rec.ev_type, rec.ev_data, rec.ev_extra1, rec.ev_extra2,
+                    rec.ev_extra3, rec.ev_extra4);
+        delete from pgque.retry_queue
+         where ev_owner = rec.ev_owner
+           and ev_id = rec.ev_id;
+    end loop;
+    return cnt;
+end;
+$$ language plpgsql; -- need admin access
+
+create or replace function pgque.maint_rotate_tables_step1(i_queue_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_rotate_tables_step1(1)
+--
+--      Rotate tables for one queue.
+--
+-- Parameters:
+--      i_queue_name        - Name of the queue
+--
+-- Returns:
+--      0
+-- ----------------------------------------------------------------------
+declare
+    badcnt          integer;
+    cf              record;
+    nr              integer;
+    tbl             text;
+    lowest_tick_id  int8;
+    lowest_xmin     int8;
+begin
+    -- check if needed and load record
+    select * from pgque.queue into cf
+        where queue_name = i_queue_name
+          and queue_rotation_period is not null
+          and queue_switch_step2 is not null
+          and queue_switch_time + queue_rotation_period < current_timestamp
+        for update;
+    if not found then
+        return 0;
+    end if;
+
+    -- if DB is in invalid state, stop
+    if pg_current_xact_id()::text::bigint < cf.queue_switch_step1 then
+        raise exception 'queue % maint failure: step1=%, current=%',
+                i_queue_name, cf.queue_switch_step1, pg_current_xact_id()::text::bigint;
+    end if;
+
+    -- find lowest tick for that queue
+    select min(sub_last_tick) into lowest_tick_id
+      from pgque.subscription
+     where sub_queue = cf.queue_id;
+
+    -- if some consumer exists
+    if lowest_tick_id is not null then
+        -- is the slowest one still on previous table?
+        select pg_snapshot_xmin(tick_snapshot)::text::bigint into lowest_xmin
+          from pgque.tick
+         where tick_queue = cf.queue_id
+           and tick_id = lowest_tick_id;
+        if not found then
+            raise exception 'queue % maint failure: tick % not found', i_queue_name, lowest_tick_id;
+        end if;
+        if lowest_xmin <= cf.queue_switch_step2 then
+            return 0; -- skip rotation then
+        end if;
+    end if;
+
+    -- nobody on previous table, we can rotate
+    
+    -- calc next table number and name
+    nr := cf.queue_cur_table + 1;
+    if nr = cf.queue_ntables then
+        nr := 0;
+    end if;
+    tbl := cf.queue_data_pfx || '_' || nr::text;
+
+    -- there may be long lock on the table from pg_dump,
+    -- detect it and skip rotate then
+    begin
+        execute 'lock table ' || pgque.quote_fqname(tbl) || ' nowait';
+        execute 'truncate ' || pgque.quote_fqname(tbl);
+    exception
+        when lock_not_available then
+            -- cannot truncate, skipping rotate
+            return 0;
+    end;
+
+    -- remember the moment
+    update pgque.queue
+        set queue_cur_table = nr,
+            queue_switch_time = current_timestamp,
+            queue_switch_step1 = pg_current_xact_id()::text::bigint,
+            queue_switch_step2 = NULL
+        where queue_id = cf.queue_id;
+
+    -- Clean ticks by using step2 txid from previous rotation.
+    -- That should keep all ticks for all batches that are completely
+    -- in old table.  This keeps them for longer than needed, but:
+    -- 1. we want the pgque.tick table to be big, to avoid Postgres
+    --    accitentally switching to seqscans on that.
+    -- 2. that way we guarantee to consumers that they an be moved
+    --    back on the queue at least for one rotation_period.
+    --    (may help in disaster recovery)
+    delete from pgque.tick
+        where tick_queue = cf.queue_id
+          and pg_snapshot_xmin(tick_snapshot)::text::bigint < cf.queue_switch_step2;
+
+    return 0;
+end;
+$$ language plpgsql; -- need admin access
+
+
+create or replace function pgque.maint_rotate_tables_step2()
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_rotate_tables_step2(0)
+--
+--      Stores the txid when the rotation was visible.  It should be
+--      called in separate transaction than pgque.maint_rotate_tables_step1()
+-- ----------------------------------------------------------------------
+begin
+    update pgque.queue
+       set queue_switch_step2 = pg_current_xact_id()::text::bigint
+     where queue_switch_step2 is null;
+    return 0;
+end;
+$$ language plpgsql; -- need admin access
+
+create or replace function pgque.maint_tables_to_vacuum()
+returns setof text as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_tables_to_vacuum(0)
+--
+--      Returns list of tablenames that need frequent vacuuming.
+--
+--      The goal is to avoid hardcoding them into maintenance process.
+--
+-- Returns:
+--      List of table names.
+-- ----------------------------------------------------------------------
+declare
+    scm text;
+    tbl text;
+    fqname text;
+begin
+    -- assume autovacuum handles them fine
+    if current_setting('autovacuum') = 'on' then
+        return;
+    end if;
+
+    for scm, tbl in values
+        ('pgque', 'subscription'),
+        ('pgque', 'consumer'),
+        ('pgque', 'queue'),
+        ('pgque', 'tick'),
+        ('pgque', 'retry_queue'),
+        ('pgq_ext', 'completed_tick'),
+        ('pgq_ext', 'completed_batch'),
+        ('pgq_ext', 'completed_event'),
+        ('pgq_ext', 'partial_batch'),
+        --('pgq_node', 'node_location'),
+        --('pgq_node', 'node_info'),
+        ('pgq_node', 'local_state'),
+        --('pgq_node', 'subscriber_info'),
+        --('londiste', 'table_info'),
+        ('londiste', 'seq_info'),
+        --('londiste', 'applied_execute'),
+        --('londiste', 'pending_fkeys'),
+        ('txid', 'epoch'),
+        ('londiste', 'completed')
+    loop
+        select n.nspname || '.' || t.relname into fqname
+            from pg_class t, pg_namespace n
+            where n.oid = t.relnamespace
+                and n.nspname = scm
+                and t.relname = tbl;
+        if found then
+            return next fqname;
+        end if;
+    end loop;
+    return;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.maint_operations(out func_name text, out func_arg text)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.maint_operations(0)
+--
+--      Returns list of functions to call for maintenance.
+--
+--      The goal is to avoid hardcoding them into maintenance process.
+--
+-- Function signature:
+--      Function should take either 1 or 0 arguments and return 1 if it wants
+--      to be called immediately again, 0 if not.
+--
+-- Returns:
+--      func_name   - Function to call
+--      func_arg    - Optional argument to function (queue name)
+-- ----------------------------------------------------------------------
+declare
+    ops text[];
+    nrot int4;
+begin
+    -- rotate step 1
+    nrot := 0;
+    func_name := 'pgque.maint_rotate_tables_step1';
+    for func_arg in
+        select queue_name from pgque.queue
+            where queue_rotation_period is not null
+                and queue_switch_step2 is not null
+                and queue_switch_time + queue_rotation_period < current_timestamp
+            order by 1
+    loop
+        nrot := nrot + 1;
+        return next;
+    end loop;
+
+    -- rotate step 2
+    if nrot = 0 then
+        select count(1) from pgque.queue
+            where queue_rotation_period is not null
+                and queue_switch_step2 is null
+            into nrot;
+    end if;
+    if nrot > 0 then
+        func_name := 'pgque.maint_rotate_tables_step2';
+        func_arg := NULL;
+        return next;
+    end if;
+
+    -- check if extra field exists
+    perform 1 from pg_attribute
+      where attrelid = 'pgque.queue'::regclass
+        and attname = 'queue_extra_maint';
+    if found then
+        -- add extra ops
+        for func_arg, ops in
+            select q.queue_name, queue_extra_maint from pgque.queue q
+             where queue_extra_maint is not null
+             order by 1
+        loop
+            for i in array_lower(ops, 1) .. array_upper(ops, 1)
+            loop
+                func_name = ops[i];
+                return next;
+            end loop;
+        end loop;
+    end if;
+
+    -- vacuum tables
+    func_name := 'vacuum';
+    for func_arg in
+        select * from pgque.maint_tables_to_vacuum()
+    loop
+        return next;
+    end loop;
+
+    return;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.grant_perms(x_queue_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.grant_perms(1)
+--
+--      Make event tables readable by public.
+--
+-- Parameters:
+--      x_queue_name        - Name of the queue.
+--
+-- Returns:
+--      nothing
+-- ----------------------------------------------------------------------
+declare
+    q           record;
+    i           integer;
+    pos         integer;
+    tbl_perms   text;
+    seq_perms   text;
+    dst_schema  text;
+    dst_table   text;
+    part_table  text;
+begin
+    select * from pgque.queue into q
+        where queue_name = x_queue_name;
+    if not found then
+        raise exception 'Queue not found';
+    end if;
+
+    -- split data table name to components
+    pos := position('.' in q.queue_data_pfx);
+    if pos > 0 then
+        dst_schema := substring(q.queue_data_pfx for pos - 1);
+        dst_table := substring(q.queue_data_pfx from pos + 1);
+    else
+        dst_schema := 'public';
+        dst_table := q.queue_data_pfx;
+    end if;
+
+    -- tick seq, normal users don't need to modify it
+    execute 'grant select on ' || pgque.quote_fqname(q.queue_tick_seq) || ' to public';
+
+    -- event seq
+    execute 'grant select on ' || pgque.quote_fqname(q.queue_event_seq) || ' to public';
+    execute 'grant usage on ' || pgque.quote_fqname(q.queue_event_seq) || ' to pgque_admin';
+
+    -- set grants on parent table
+    perform pgque._grant_perms_from('pgque', 'event_template', dst_schema, dst_table);
+
+    -- set grants on real event tables
+    for i in 0 .. q.queue_ntables - 1 loop
+        part_table := dst_table  || '_' || i::text;
+        perform pgque._grant_perms_from('pgque', 'event_template', dst_schema, part_table);
+    end loop;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque._grant_perms_from(src_schema text, src_table text, dst_schema text, dst_table text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.grant_perms_from(1)
+--
+--      Copy grants from one table to another.
+--      Workaround for missing GRANTS option for CREATE TABLE LIKE.
+-- ----------------------------------------------------------------------
+declare
+    fq_table text;
+    sql text;
+    g record;
+    q_grantee text;
+begin
+    fq_table := quote_ident(dst_schema) || '.' || quote_ident(dst_table);
+
+    for g in
+        select grantor, grantee, privilege_type, is_grantable
+            from information_schema.table_privileges
+            where table_schema = src_schema
+                and table_name = src_table
+    loop
+        if g.grantee = 'PUBLIC' then
+            q_grantee = 'public';
+        else
+            q_grantee = quote_ident(g.grantee);
+        end if;
+        sql := 'grant ' || g.privilege_type || ' on ' || fq_table
+            || ' to ' || q_grantee;
+        if g.is_grantable = 'YES' then
+            sql := sql || ' with grant option';
+        end if;
+        execute sql;
+    end loop;
+
+    return 1;
+end;
+$$ language plpgsql strict;
+
+create or replace function pgque.tune_storage(i_queue_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.tune_storage(1)
+--
+--      Tunes storage settings for queue data tables
+-- ----------------------------------------------------------------------
+declare
+    tbl  text;
+    tbloid oid;
+    q record;
+    i int4;
+    sql text;
+    pgver int4;
+begin
+    pgver := current_setting('server_version_num');
+
+    select * into q
+      from pgque.queue where queue_name = i_queue_name;
+    if not found then
+        return 0;
+    end if;
+
+    for i in 0 .. (q.queue_ntables - 1) loop
+        tbl := q.queue_data_pfx || '_' || i::text;
+
+        -- set fillfactor
+        sql := 'alter table ' || tbl || ' set (fillfactor = 100';
+
+        -- autovacuum for 8.4+
+        if pgver >= 80400 then
+            sql := sql || ', autovacuum_enabled=off, toast.autovacuum_enabled =off';
+        end if;
+        sql := sql || ')';
+        execute sql;
+
+        -- autovacuum for 8.3
+        if pgver < 80400 then
+            tbloid := tbl::regclass::oid;
+            delete from pg_catalog.pg_autovacuum where vacrelid = tbloid;
+            insert into pg_catalog.pg_autovacuum values (tbloid, false, -1,-1,-1,-1,-1,-1,-1,-1);
+        end if;
+    end loop;
+
+    return 1;
+end;
+$$ language plpgsql strict;
+
+
+
+create or replace function pgque.force_tick(i_queue_name text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.force_tick(2)
+--
+--      Simulate lots of events happening to force ticker to tick.
+--
+--      Should be called in loop, with some delay until last tick
+--      changes or too much time is passed.
+--
+--      Such function is needed because paraller calls of pgque.ticker() are
+--      dangerous, and cannot be protected with locks as snapshot
+--      is taken before locking.
+--
+-- Parameters:
+--      i_queue_name     - Name of the queue
+--
+-- Returns:
+--      Currently last tick id.
+-- ----------------------------------------------------------------------
+declare
+    q  record;
+    t  record;
+begin
+    -- bump seq and get queue id
+    select queue_id,
+           setval(queue_event_seq, nextval(queue_event_seq)
+                                   + queue_ticker_max_count * 2 + 1000) as tmp
+      into q from pgque.queue
+     where queue_name = i_queue_name
+       and not queue_external_ticker
+       and not queue_ticker_paused;
+
+    --if not found then
+    --    raise notice 'queue not found or ticks not allowed';
+    --end if;
+
+    -- return last tick id
+    select tick_id into t
+      from pgque.tick, pgque.queue
+     where tick_queue = queue_id and queue_name = i_queue_name
+     order by tick_queue desc, tick_id desc limit 1;
+
+    return t.tick_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.seq_getval(i_seq_name text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.seq_getval(1)
+--
+--      Read current last_val from seq, without affecting it.
+--
+-- Parameters:
+--      i_seq_name     - Name of the sequence
+--
+-- Returns:
+--      last value.
+-- ----------------------------------------------------------------------
+declare
+    res     int8;
+    fqname  text;
+    pos     integer;
+    s       text;
+    n       text;
+begin
+    pos := position('.' in i_seq_name);
+    if pos > 0 then
+        s := substring(i_seq_name for pos - 1);
+        n := substring(i_seq_name from pos + 1);
+    else
+        s := 'public';
+        n := i_seq_name;
+    end if;
+    fqname := quote_ident(s) || '.' || quote_ident(n);
+
+    execute 'select last_value from ' || fqname into res;
+    return res;
+end;
+$$ language plpgsql strict;
+
+create or replace function pgque.seq_setval(i_seq_name text, i_new_value int8)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.seq_setval(2)
+--
+--      Like setval() but does not allow going back.
+--
+-- Parameters:
+--      i_seq_name      - Name of the sequence
+--      i_new_value     - new value
+--
+-- Returns:
+--      current last value.
+-- ----------------------------------------------------------------------
+declare
+    res     int8;
+    fqname  text;
+begin
+    fqname := pgque.quote_fqname(i_seq_name);
+
+    res := pgque.seq_getval(i_seq_name);
+    if res < i_new_value then
+        perform setval(fqname, i_new_value);
+        return i_new_value;
+    end if;
+    return res;
+end;
+$$ language plpgsql strict;
+
+
+create or replace function pgque.quote_fqname(i_name text)
+returns text as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.quote_fqname(1)
+--
+--      Quete fully-qualified object name for SQL.
+--
+--      First dot is taken as schema separator.
+--
+--      If schema is missing, 'public' is assumed.
+--
+-- Parameters:
+--      i_name  - fully qualified object name.
+--
+-- Returns:
+--      Quoted name.
+-- ----------------------------------------------------------------------
+declare
+    res     text;
+    pos     integer;
+    s       text;
+    n       text;
+begin
+    pos := position('.' in i_name);
+    if pos > 0 then
+        s := substring(i_name for pos - 1);
+        n := substring(i_name from pos + 1);
+    else
+        s := 'public';
+        n := i_name;
+    end if;
+    return quote_ident(s) || '.' || quote_ident(n);
+end;
+$$ language plpgsql strict immutable;
+
+create or replace function pgque.create_queue(i_queue_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.create_queue(1)
+--
+--      Creates new queue with given name.
+--
+-- Returns:
+--      0 - queue already exists
+--      1 - queue created
+-- Calls:
+--      pgque.grant_perms(i_queue_name);
+--      pgque.ticker(i_queue_name);
+--      pgque.tune_storage(i_queue_name);
+-- Tables directly manipulated:
+--      insert - pgque.queue
+--      create - pgque.event_N () inherits (pgque.event_template)
+--      create - pgque.event_N_0 .. pgque.event_N_M () inherits (pgque.event_N)
+-- ----------------------------------------------------------------------
+declare
+    tblpfx   text;
+    tblname  text;
+    idxpfx   text;
+    idxname  text;
+    sql      text;
+    id       integer;
+    tick_seq text;
+    ev_seq text;
+    n_tables integer;
+begin
+    if i_queue_name is null then
+        raise exception 'Invalid NULL value';
+    end if;
+
+    -- pg_notify channel names are limited to 63 bytes by PostgreSQL.
+    -- PgQue prefixes them with 'pgque_' (6 bytes), leaving 57 bytes for
+    -- the queue name.  Reject names that would overflow the channel name
+    -- before any state is written, so callers get a clear error.
+    if octet_length(i_queue_name) > 57 then
+        raise exception 'queue name too long: % bytes (max 57). '
+            'pg_notify channel ''pgque_<queue_name>'' must fit in 63 bytes.',
+            octet_length(i_queue_name);
+    end if;
+
+    -- check if exists
+    perform 1 from pgque.queue where queue_name = i_queue_name;
+    if found then
+        return 0;
+    end if;
+
+    -- insert event
+    id := nextval('pgque.queue_queue_id_seq');
+    tblpfx := 'pgque.event_' || id::text;
+    idxpfx := 'event_' || id::text;
+    tick_seq := 'pgque.event_' || id::text || '_tick_seq';
+    ev_seq := 'pgque.event_' || id::text || '_id_seq';
+    insert into pgque.queue (queue_id, queue_name,
+            queue_data_pfx, queue_event_seq, queue_tick_seq)
+        values (id, i_queue_name, tblpfx, ev_seq, tick_seq);
+
+    select queue_ntables into n_tables from pgque.queue
+        where queue_id = id;
+
+    -- create seqs
+    execute 'CREATE SEQUENCE ' || pgque.quote_fqname(tick_seq);
+    execute 'CREATE SEQUENCE ' || pgque.quote_fqname(ev_seq);
+
+    -- create data tables
+    execute 'CREATE TABLE ' || pgque.quote_fqname(tblpfx) || ' () '
+            || ' INHERITS (pgque.event_template)';
+    for i in 0 .. (n_tables - 1) loop
+        tblname := tblpfx || '_' || i::text;
+        idxname := idxpfx || '_' || i::text || '_txid_idx';
+        execute 'CREATE TABLE ' || pgque.quote_fqname(tblname) || ' () '
+                || ' INHERITS (' || pgque.quote_fqname(tblpfx) || ')';
+        execute 'ALTER TABLE ' || pgque.quote_fqname(tblname) || ' ALTER COLUMN ev_id '
+                || ' SET DEFAULT nextval(' || quote_literal(ev_seq) || ')';
+        execute 'create index ' || quote_ident(idxname) || ' on '
+                || pgque.quote_fqname(tblname) || ' (ev_txid)';
+    end loop;
+
+    perform pgque.grant_perms(i_queue_name);
+
+    perform pgque.ticker(i_queue_name);
+
+    perform pgque.tune_storage(i_queue_name);
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.drop_queue(x_queue_name text, x_force bool)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.drop_queue(2)
+--
+--     Drop queue and all associated tables.
+--
+-- Parameters:
+--      x_queue_name    - queue name
+--      x_force         - ignore (drop) existing consumers
+-- Returns:
+--      1 - success
+-- Calls:
+--      pgque.unregister_consumer(queue_name, consumer_name)
+--      perform pgque.ticker(i_queue_name);
+--      perform pgque.tune_storage(i_queue_name);
+-- Tables directly manipulated:
+--      delete - pgque.queue
+--      drop - pgque.event_N (), pgque.event_N_0 .. pgque.event_N_M 
+-- ----------------------------------------------------------------------
+declare
+    tblname  text;
+    q record;
+    num integer;
+begin
+    -- check if exists
+    select * into q from pgque.queue
+        where queue_name = x_queue_name
+        for update;
+    if not found then
+        raise exception 'No such event queue';
+    end if;
+
+    if x_force then
+        perform pgque.unregister_consumer(queue_name, consumer_name)
+           from pgque.get_consumer_info(x_queue_name);
+    else
+        -- check if no consumers
+        select count(*) into num from pgque.subscription
+            where sub_queue = q.queue_id;
+        if num > 0 then
+            raise exception 'cannot drop queue, consumers still attached';
+        end if;
+    end if;
+
+    -- drop data tables
+    for i in 0 .. (q.queue_ntables - 1) loop
+        tblname := q.queue_data_pfx || '_' || i::text;
+        execute 'DROP TABLE ' || pgque.quote_fqname(tblname);
+    end loop;
+    execute 'DROP TABLE ' || pgque.quote_fqname(q.queue_data_pfx);
+
+    -- delete ticks
+    delete from pgque.tick where tick_queue = q.queue_id;
+
+    -- drop seqs
+    -- FIXME: any checks needed here?
+    execute 'DROP SEQUENCE ' || pgque.quote_fqname(q.queue_tick_seq);
+    execute 'DROP SEQUENCE ' || pgque.quote_fqname(q.queue_event_seq);
+
+    -- delete event
+    delete from pgque.queue
+        where queue_name = x_queue_name;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.drop_queue(x_queue_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.drop_queue(1)
+--
+--     Drop queue and all associated tables.
+--     No consumers must be listening on the queue.
+--
+-- ----------------------------------------------------------------------
+begin
+    return pgque.drop_queue(x_queue_name, false);
+end;
+$$ language plpgsql strict;
+
+
+create or replace function pgque.set_queue_config(
+    x_queue_name    text,
+    x_param_name    text,
+    x_param_value   text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.set_queue_config(3)
+--
+--
+--     Set configuration for specified queue.
+--
+-- Parameters:
+--      x_queue_name    - Name of the queue to configure.
+--      x_param_name    - Configuration parameter name.
+--      x_param_value   - Configuration parameter value.
+--  
+-- Returns:
+--     0 if event was already in queue, 1 otherwise.
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      update - pgque.queue
+-- ----------------------------------------------------------------------
+declare
+    v_param_name    text;
+begin
+    -- discard NULL input
+    if x_queue_name is null or x_param_name is null then
+        raise exception 'Invalid NULL value';
+    end if;
+
+    -- check if queue exists
+    perform 1 from pgque.queue where queue_name = x_queue_name;
+    if not found then
+        raise exception 'No such event queue';
+    end if;
+
+    -- check if valid parameter name
+    v_param_name := 'queue_' || x_param_name;
+    if v_param_name not in (
+        'queue_ticker_max_count',
+        'queue_ticker_max_lag',
+        'queue_ticker_idle_period',
+        'queue_ticker_paused',
+        'queue_rotation_period',
+        'queue_external_ticker')
+    then
+        raise exception 'cannot change parameter "%s"', x_param_name;
+    end if;
+
+    execute 'update pgque.queue set ' 
+        || v_param_name || ' = ' || quote_literal(x_param_value)
+        || ' where queue_name = ' || quote_literal(x_queue_name);
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.insert_event(queue_name text, ev_type text, ev_data text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.insert_event(3)
+--
+--      Insert a event into queue.
+--
+-- Parameters:
+--      queue_name      - Name of the queue
+--      ev_type         - User-specified type for the event
+--      ev_data         - User data for the event
+--
+-- Returns:
+--      Event ID
+-- Calls:
+--      pgque.insert_event(7)
+-- ----------------------------------------------------------------------
+begin
+    return pgque.insert_event(queue_name, ev_type, ev_data, null, null, null, null);
+end;
+$$ language plpgsql;
+
+
+
+create or replace function pgque.insert_event(
+    queue_name text, ev_type text, ev_data text,
+    ev_extra1 text, ev_extra2 text, ev_extra3 text, ev_extra4 text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.insert_event(7)
+--
+--      Insert a event into queue with all the extra fields.
+--
+-- Parameters:
+--      queue_name      - Name of the queue
+--      ev_type         - User-specified type for the event
+--      ev_data         - User data for the event
+--      ev_extra1       - Extra data field for the event
+--      ev_extra2       - Extra data field for the event
+--      ev_extra3       - Extra data field for the event
+--      ev_extra4       - Extra data field for the event
+--
+-- Returns:
+--      Event ID
+-- Calls:
+--      pgque.insert_event_raw(11)
+-- Tables directly manipulated:
+--      insert - pgque.insert_event_raw(11), a C function, inserts into current event_N_M table
+-- ----------------------------------------------------------------------
+begin
+    return pgque.insert_event_raw(queue_name, null, now(), null, null,
+            ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.current_event_table(x_queue_name text)
+returns text as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.current_event_table(1)
+--
+--      Return active event table for particular queue.
+--      Event can be added to it without going via functions,
+--      e.g. by COPY.
+--
+--      If queue is disabled and GUC session_replication_role <> 'replica'
+--      then raises exception.
+--
+--      or expressed in a different way - an even table of a disabled queue
+--      is returned only on replica
+--
+-- Note:
+--      The result is valid only during current transaction.
+--
+-- Permissions:
+--      Actual insertion requires superuser access.
+--
+-- Parameters:
+--      x_queue_name    - Queue name.
+-- ----------------------------------------------------------------------
+declare
+    res text;
+    disabled boolean;
+begin
+    select queue_data_pfx || '_' || queue_cur_table::text,
+           queue_disable_insert
+        into res, disabled
+        from pgque.queue where queue_name = x_queue_name;
+    if not found then
+        raise exception 'Event queue not found';
+    end if;
+    if disabled then
+        if current_setting('session_replication_role') <> 'replica' then
+            raise exception 'Writing to queue disabled';
+        end if;
+    end if;
+    return res;
+end;
+$$ language plpgsql; -- no perms needed
+
+create or replace function pgque.register_consumer(
+    x_queue_name text,
+    x_consumer_id text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.register_consumer(2)
+--
+--      Subscribe consumer on a queue.
+--
+--      From this moment forward, consumer will see all events in the queue.
+--
+-- Parameters:
+--      x_queue_name        - Name of queue
+--      x_consumer_name     - Name of consumer
+--
+-- Returns:
+--      0  - if already registered
+--      1  - if new registration
+-- Calls:
+--      pgque.register_consumer_at(3)
+-- Tables directly manipulated:
+--      None
+-- ----------------------------------------------------------------------
+begin
+    return pgque.register_consumer_at(x_queue_name, x_consumer_id, NULL);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.register_consumer_at(
+    x_queue_name text,
+    x_consumer_name text,
+    x_tick_pos bigint)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.register_consumer_at(3)
+--
+--      Extended registration, allows to specify tick_id.
+--
+-- Note:
+--      For usage in special situations.
+--
+-- Parameters:
+--      x_queue_name        - Name of a queue
+--      x_consumer_name     - Name of consumer
+--      x_tick_pos          - Tick ID
+--
+-- Returns:
+--      0/1 whether consumer has already registered.
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      update/insert - pgque.subscription
+-- ----------------------------------------------------------------------
+declare
+    tmp         text;
+    last_tick   bigint;
+    x_queue_id  integer;
+    x_consumer_id integer;
+    queue integer;
+    sub record;
+begin
+    select queue_id into x_queue_id from pgque.queue
+        where queue_name = x_queue_name;
+    if not found then
+        raise exception 'Event queue not created yet';
+    end if;
+
+    -- get consumer and create if new
+    select co_id into x_consumer_id from pgque.consumer
+        where co_name = x_consumer_name
+        for update;
+    if not found then
+        insert into pgque.consumer (co_name) values (x_consumer_name);
+        x_consumer_id := currval('pgque.consumer_co_id_seq');
+    end if;
+
+    -- if particular tick was requested, check if it exists
+    if x_tick_pos is not null then
+        perform 1 from pgque.tick
+            where tick_queue = x_queue_id
+              and tick_id = x_tick_pos;
+        if not found then
+            raise exception 'cannot reposition, tick not found: %', x_tick_pos;
+        end if;
+    end if;
+
+    -- check if already registered
+    select sub_last_tick, sub_batch into sub
+        from pgque.subscription
+        where sub_consumer = x_consumer_id
+          and sub_queue  = x_queue_id;
+    if found then
+        if x_tick_pos is not null then
+            -- if requested, update tick pos and drop partial batch
+            update pgque.subscription
+                set sub_last_tick = x_tick_pos,
+                    sub_batch = null,
+                    sub_next_tick = null,
+                    sub_active = now()
+                where sub_consumer = x_consumer_id
+                  and sub_queue = x_queue_id;
+        end if;
+        -- already registered
+        return 0;
+    end if;
+
+    --  new registration
+    if x_tick_pos is null then
+        -- start from current tick
+        select tick_id into last_tick from pgque.tick
+            where tick_queue = x_queue_id
+            order by tick_queue desc, tick_id desc
+            limit 1;
+        if not found then
+            raise exception 'No ticks for this queue.  Please run ticker on database.';
+        end if;
+    else
+        last_tick := x_tick_pos;
+    end if;
+
+    -- register
+    insert into pgque.subscription (sub_queue, sub_consumer, sub_last_tick)
+        values (x_queue_id, x_consumer_id, last_tick);
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.unregister_consumer(
+    x_queue_name text,
+    x_consumer_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.unregister_consumer(2)
+--
+--      Unsubscribe consumer from the queue.
+--      Also consumer's retry events are deleted.
+--
+-- Parameters:
+--      x_queue_name        - Name of the queue
+--      x_consumer_name     - Name of the consumer
+--
+-- Returns:
+--      number of (sub)consumers unregistered
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      delete - pgque.retry_queue
+--      delete - pgque.subscription
+-- ----------------------------------------------------------------------
+declare
+    x_sub_id integer;
+    _sub_id_cnt integer;
+    _consumer_id integer;
+    _is_subconsumer boolean;
+begin
+    select s.sub_id, c.co_id,
+           -- subconsumers can only have both null or both not null - main consumer for subconsumers has only one not null
+           (s.sub_last_tick IS NULL AND s.sub_next_tick IS NULL) OR (s.sub_last_tick IS NOT NULL AND s.sub_next_tick IS NOT NULL)
+      into x_sub_id, _consumer_id, _is_subconsumer
+      from pgque.subscription s, pgque.consumer c, pgque.queue q
+     where s.sub_queue = q.queue_id
+       and s.sub_consumer = c.co_id
+       and q.queue_name = x_queue_name
+       and c.co_name = x_consumer_name
+       for update of s, c;
+    if not found then
+        return 0;
+    end if;
+
+    -- consumer + subconsumer count
+    select count(*) into _sub_id_cnt
+        from pgque.subscription
+       where sub_id = x_sub_id;
+
+    -- delete only one subconsumer
+    if _sub_id_cnt > 1 and _is_subconsumer then
+        delete from pgque.subscription
+              where sub_id = x_sub_id
+                and sub_consumer = _consumer_id;
+        return 1;
+    else
+        -- delete main consumer (including possible subconsumers)
+
+        -- retry events
+        delete from pgque.retry_queue
+            where ev_owner = x_sub_id;
+
+        -- this will drop subconsumers too
+        delete from pgque.subscription
+            where sub_id = x_sub_id;
+
+        perform 1 from pgque.subscription
+            where sub_consumer = _consumer_id;
+        if not found then
+            delete from pgque.consumer
+                where co_id = _consumer_id;
+        end if;
+
+        return _sub_id_cnt;
+    end if;
+
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.next_batch_info(
+    in i_queue_name text,
+    in i_consumer_name text,
+    out batch_id int8,
+    out cur_tick_id int8,
+    out prev_tick_id int8,
+    out cur_tick_time timestamptz,
+    out prev_tick_time timestamptz,
+    out cur_tick_event_seq int8,
+    out prev_tick_event_seq int8)
+as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.next_batch_info(2)
+--
+--      Makes next block of events active.
+--
+--      If it returns NULL, there is no events available in queue.
+--      Consumer should sleep then.
+--
+--      The values from event_id sequence may give hint how big the
+--      batch may be.  But they are inexact, they do not give exact size.
+--      Client *MUST NOT* use them to detect whether the batch contains any
+--      events at all - the values are unfit for that purpose.
+--
+-- Parameters:
+--      i_queue_name        - Name of the queue
+--      i_consumer_name     - Name of the consumer
+--
+-- Returns:
+--      batch_id            - Batch ID or NULL if there are no more events available.
+--      cur_tick_id         - End tick id.
+--      cur_tick_time       - End tick time.
+--      cur_tick_event_seq  - Value from event id sequence at the time tick was issued.
+--      prev_tick_id        - Start tick id.
+--      prev_tick_time      - Start tick time.
+--      prev_tick_event_seq - value from event id sequence at the time tick was issued.
+-- Calls:
+--      pgque.next_batch_custom(5)
+-- Tables directly manipulated:
+--      None
+-- ----------------------------------------------------------------------
+begin
+    select f.batch_id, f.cur_tick_id, f.prev_tick_id,
+           f.cur_tick_time, f.prev_tick_time,
+           f.cur_tick_event_seq, f.prev_tick_event_seq
+        into batch_id, cur_tick_id, prev_tick_id, cur_tick_time, prev_tick_time,
+             cur_tick_event_seq, prev_tick_event_seq
+        from pgque.next_batch_custom(i_queue_name, i_consumer_name, NULL, NULL, NULL) f;
+    return;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.next_batch(
+    in i_queue_name text,
+    in i_consumer_name text)
+returns int8 as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.next_batch(2)
+--
+--      Old function that returns just batch_id.
+--
+-- Parameters:
+--      i_queue_name        - Name of the queue
+--      i_consumer_name     - Name of the consumer
+--
+-- Returns:
+--      Batch ID or NULL if there are no more events available.
+-- ----------------------------------------------------------------------
+declare
+    res int8;
+begin
+    select batch_id into res
+        from pgque.next_batch_info(i_queue_name, i_consumer_name);
+    return res;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.next_batch_custom(
+    in i_queue_name text,
+    in i_consumer_name text,
+    in i_min_lag interval,
+    in i_min_count int4,
+    in i_min_interval interval,
+    out batch_id int8,
+    out cur_tick_id int8,
+    out prev_tick_id int8,
+    out cur_tick_time timestamptz,
+    out prev_tick_time timestamptz,
+    out cur_tick_event_seq int8,
+    out prev_tick_event_seq int8)
+as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.next_batch_custom(5)
+--
+--      Makes next block of events active.  Block size can be tuned
+--      with i_min_count, i_min_interval parameters.  Events age can
+--      be tuned with i_min_lag.
+--
+--      If it returns NULL, there is no events available in queue.
+--      Consumer should sleep then.
+--
+--      The values from event_id sequence may give hint how big the
+--      batch may be.  But they are inexact, they do not give exact size.
+--      Client *MUST NOT* use them to detect whether the batch contains any
+--      events at all - the values are unfit for that purpose.
+--
+-- Note:
+--      i_min_lag together with i_min_interval/i_min_count is inefficient.
+--
+-- Parameters:
+--      i_queue_name        - Name of the queue
+--      i_consumer_name     - Name of the consumer
+--      i_min_lag           - Consumer wants events older than that
+--      i_min_count         - Consumer wants batch to contain at least this many events
+--      i_min_interval      - Consumer wants batch to cover at least this much time
+--
+-- Returns:
+--      batch_id            - Batch ID or NULL if there are no more events available.
+--      cur_tick_id         - End tick id.
+--      cur_tick_time       - End tick time.
+--      cur_tick_event_seq  - Value from event id sequence at the time tick was issued.
+--      prev_tick_id        - Start tick id.
+--      prev_tick_time      - Start tick time.
+--      prev_tick_event_seq - value from event id sequence at the time tick was issued.
+-- Calls:
+--      pgque.insert_event_raw(11)
+-- Tables directly manipulated:
+--      update - pgque.subscription
+-- ----------------------------------------------------------------------
+declare
+    errmsg          text;
+    queue_id        integer;
+    sub_id          integer;
+    cons_id         integer;
+begin
+    select s.sub_queue, s.sub_consumer, s.sub_id, s.sub_batch,
+            t1.tick_id, t1.tick_time, t1.tick_event_seq,
+            t2.tick_id, t2.tick_time, t2.tick_event_seq
+        into queue_id, cons_id, sub_id, batch_id,
+             prev_tick_id, prev_tick_time, prev_tick_event_seq,
+             cur_tick_id, cur_tick_time, cur_tick_event_seq
+        from pgque.consumer c,
+             pgque.queue q,
+             pgque.subscription s
+             left join pgque.tick t1
+                on (t1.tick_queue = s.sub_queue
+                    and t1.tick_id = s.sub_last_tick)
+             left join pgque.tick t2
+                on (t2.tick_queue = s.sub_queue
+                    and t2.tick_id = s.sub_next_tick)
+        where q.queue_name = i_queue_name
+          and c.co_name = i_consumer_name
+          and s.sub_queue = q.queue_id
+          and s.sub_consumer = c.co_id;
+    if not found then
+        errmsg := 'Not subscriber to queue: '
+            || coalesce(i_queue_name, 'NULL')
+            || '/'
+            || coalesce(i_consumer_name, 'NULL');
+        raise exception '%', errmsg;
+    end if;
+
+    -- sanity check
+    if prev_tick_id is null then
+        raise exception 'PgQ corruption: Consumer % on queue % does not see tick %', i_consumer_name, i_queue_name, prev_tick_id;
+    end if;
+
+    -- has already active batch
+    if batch_id is not null then
+        return;
+    end if;
+
+    if i_min_interval is null and i_min_count is null then
+        -- find next tick
+        select tick_id, tick_time, tick_event_seq
+            into cur_tick_id, cur_tick_time, cur_tick_event_seq
+            from pgque.tick
+            where tick_id > prev_tick_id
+              and tick_queue = queue_id
+            order by tick_queue asc, tick_id asc
+            limit 1;
+    else
+        -- find custom tick
+        select next_tick_id, next_tick_time, next_tick_seq
+          into cur_tick_id, cur_tick_time, cur_tick_event_seq
+          from pgque.find_tick_helper(queue_id, prev_tick_id,
+                                    prev_tick_time, prev_tick_event_seq,
+                                    i_min_count, i_min_interval);
+    end if;
+
+    if i_min_lag is not null then
+        -- enforce min lag
+        if now() - cur_tick_time < i_min_lag then
+            cur_tick_id := NULL;
+            cur_tick_time := NULL;
+            cur_tick_event_seq := NULL;
+        end if;
+    end if;
+
+    if cur_tick_id is null then
+        -- nothing to do
+        prev_tick_id := null;
+        prev_tick_time := null;
+        prev_tick_event_seq := null;
+        return;
+    end if;
+
+    -- get next batch
+    batch_id := nextval('pgque.batch_id_seq');
+    update pgque.subscription
+        set sub_batch = batch_id,
+            sub_next_tick = cur_tick_id,
+            sub_active = now()
+        where sub_queue = queue_id
+          and sub_consumer = cons_id;
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.get_batch_events(
+    in x_batch_id   bigint,
+    out ev_id       bigint,
+    out ev_time     timestamptz,
+    out ev_txid     bigint,
+    out ev_retry    int4,
+    out ev_type     text,
+    out ev_data     text,
+    out ev_extra1   text,
+    out ev_extra2   text,
+    out ev_extra3   text,
+    out ev_extra4   text)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_batch_events(1)
+--
+--      Get all events in batch.
+--
+-- Parameters:
+--      x_batch_id      - ID of active batch.
+--
+-- Returns:
+--      List of events.
+-- ----------------------------------------------------------------------
+declare
+    sql text;
+begin
+    sql := pgque.batch_event_sql(x_batch_id);
+    for ev_id, ev_time, ev_txid, ev_retry, ev_type, ev_data,
+        ev_extra1, ev_extra2, ev_extra3, ev_extra4
+        in execute sql
+    loop
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql; -- no perms needed
+
+
+-- ----------------------------------------------------------------------
+-- Advanced PgQ-compatible primitive. Application roles should use
+-- pgque.receive(); get_batch_cursor is kept admin-only in the grants block.
+--
+-- SECURITY: i_extra_where is concatenated into dynamic SQL verbatim. It is a
+-- trusted-SQL fragment, NOT a parameter. A caller can inject arbitrary
+-- predicates (including UNION ALL) and forge rows in the returned stream.
+-- This behavior is inherited from upstream PgQ; it is acceptable here only
+-- because both overloads are revoked from public, pgque_reader, and
+-- pgque_writer and granted to pgque_admin only. NEVER pass user-controlled
+-- input as i_extra_where, even from admin code paths.
+-- ----------------------------------------------------------------------
+create or replace function pgque.get_batch_cursor(
+    in i_batch_id       bigint,
+    in i_cursor_name    text,
+    in i_quick_limit    int4,
+    in i_extra_where    text,
+
+    out ev_id       bigint,
+    out ev_time     timestamptz,
+    out ev_txid     bigint,
+    out ev_retry    int4,
+    out ev_type     text,
+    out ev_data     text,
+    out ev_extra1   text,
+    out ev_extra2   text,
+    out ev_extra3   text,
+    out ev_extra4   text)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_batch_cursor(4)
+--
+--      Get events in batch using a cursor.
+--
+-- Parameters:
+--      i_batch_id      - ID of active batch.
+--      i_cursor_name   - Name for new cursor
+--      i_quick_limit   - Number of events to return immediately
+--      i_extra_where   - optional where clause to filter events.
+--                        Trusted SQL fragment, not a parameter; never pass
+--                        user-controlled text. Function is admin-only.
+--
+-- Returns:
+--      List of events.
+-- Calls:
+--      pgque.batch_event_sql(i_batch_id) - internal function which generates SQL optimised specially for getting events in this batch
+-- ----------------------------------------------------------------------
+declare
+    _cname  text;
+    _sql    text;
+begin
+    if i_batch_id is null or i_cursor_name is null or i_quick_limit is null then
+        return;
+    end if;
+
+    _cname := quote_ident(i_cursor_name);
+    _sql := pgque.batch_event_sql(i_batch_id);
+
+    -- apply extra where
+    if i_extra_where is not null then
+        _sql := replace(_sql, ' order by 1', '');
+        _sql := 'select * from (' || _sql
+            || ') _evs where ' || i_extra_where
+            || ' order by 1';
+    end if;
+
+    -- create cursor
+    execute 'declare ' || _cname || ' no scroll cursor for ' || _sql;
+
+    -- if no events wanted, don't bother with execute
+    if i_quick_limit <= 0 then
+        return;
+    end if;
+
+    -- return first block of events
+    for ev_id, ev_time, ev_txid, ev_retry, ev_type, ev_data,
+        ev_extra1, ev_extra2, ev_extra3, ev_extra4
+        in execute 'fetch ' || i_quick_limit::text || ' from ' || _cname
+    loop
+        return next;
+    end loop;
+
+    return;
+end;
+$$ language plpgsql; -- no perms needed
+
+create or replace function pgque.get_batch_cursor(
+    in i_batch_id       bigint,
+    in i_cursor_name    text,
+    in i_quick_limit    int4,
+
+    out ev_id       bigint,
+    out ev_time     timestamptz,
+    out ev_txid     bigint,
+    out ev_retry    int4,
+    out ev_type     text,
+    out ev_data     text,
+    out ev_extra1   text,
+    out ev_extra2   text,
+    out ev_extra3   text,
+    out ev_extra4   text)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_batch_cursor(3)
+--
+--      Get events in batch using a cursor.
+--
+-- Parameters:
+--      i_batch_id      - ID of active batch.
+--      i_cursor_name   - Name for new cursor
+--      i_quick_limit   - Number of events to return immediately
+--
+-- Returns:
+--      List of events.
+-- Calls:
+--      pgque.get_batch_cursor(4)
+-- ----------------------------------------------------------------------
+begin
+    for ev_id, ev_time, ev_txid, ev_retry, ev_type, ev_data,
+        ev_extra1, ev_extra2, ev_extra3, ev_extra4
+    in
+        select * from pgque.get_batch_cursor(i_batch_id,
+            i_cursor_name, i_quick_limit, null)
+    loop
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql strict; -- no perms needed
+
+create or replace function pgque.event_retry(
+    x_batch_id bigint,
+    x_event_id bigint,
+    x_retry_time timestamptz)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.event_retry(3a)
+--
+--     Put the event into retry queue, to be processed again later.
+--
+-- Parameters:
+--      x_batch_id      - ID of active batch.
+--      x_event_id      - event id
+--      x_retry_time    - Time when the event should be put back into queue
+--
+-- Returns:
+--     1 - success
+--     0 - event already in retry queue
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      insert - pgque.retry_queue
+-- ----------------------------------------------------------------------
+begin
+    insert into pgque.retry_queue (ev_retry_after, ev_queue,
+        ev_id, ev_time, ev_txid, ev_owner, ev_retry, ev_type, ev_data,
+        ev_extra1, ev_extra2, ev_extra3, ev_extra4)
+    select x_retry_time, sub_queue,
+           ev_id, ev_time, NULL, sub_id, coalesce(ev_retry, 0) + 1,
+           ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4
+      from pgque.get_batch_events(x_batch_id),
+           pgque.subscription
+     where sub_batch = x_batch_id
+       and ev_id = x_event_id;
+    if not found then
+        raise exception 'event not found';
+    end if;
+    return 1;
+
+-- dont worry if the event is already in queue
+exception
+    when unique_violation then
+        return 0;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.event_retry(
+    x_batch_id bigint,
+    x_event_id bigint,
+    x_retry_seconds integer)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.event_retry(3b)
+--
+--     Put the event into retry queue, to be processed later again.
+--
+-- Parameters:
+--      x_batch_id      - ID of active batch.
+--      x_event_id      - event id
+--      x_retry_seconds - Time when the event should be put back into queue
+--
+-- Returns:
+--     1 - success
+--     0 - event already in retry queue
+-- Calls:
+--      pgque.event_retry(3a)
+-- Tables directly manipulated:
+--      None
+-- ----------------------------------------------------------------------
+declare
+    new_retry  timestamptz;
+begin
+    new_retry := current_timestamp + ((x_retry_seconds::text || ' seconds')::interval);
+    return pgque.event_retry(x_batch_id, x_event_id, new_retry);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.batch_retry(
+    i_batch_id bigint,
+    i_retry_seconds integer)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.batch_retry(2)
+--
+--     Put whole batch into retry queue, to be processed again later.
+--
+-- Parameters:
+--      i_batch_id      - ID of active batch.
+--      i_retry_time    - Time when the event should be put back into queue
+--
+-- Returns:
+--     number of events inserted
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      pgque.retry_queue
+-- ----------------------------------------------------------------------
+declare
+    _retry timestamptz;
+    _cnt   integer;
+    _s     record;
+begin
+    _retry := current_timestamp + ((i_retry_seconds::text || ' seconds')::interval);
+
+    select * into _s from pgque.subscription where sub_batch = i_batch_id;
+    if not found then
+        raise exception 'batch_retry: batch % not found', i_batch_id;
+    end if;
+
+    insert into pgque.retry_queue (ev_retry_after, ev_queue,
+        ev_id, ev_time, ev_txid, ev_owner, ev_retry,
+        ev_type, ev_data, ev_extra1, ev_extra2,
+        ev_extra3, ev_extra4)
+    select distinct _retry, _s.sub_queue,
+           b.ev_id, b.ev_time, NULL::xid8, _s.sub_id, coalesce(b.ev_retry, 0) + 1,
+           b.ev_type, b.ev_data, b.ev_extra1, b.ev_extra2,
+           b.ev_extra3, b.ev_extra4
+      from pgque.get_batch_events(i_batch_id) b
+           left join pgque.retry_queue rq
+                  on (rq.ev_id = b.ev_id
+                      and rq.ev_owner = _s.sub_id
+                      and rq.ev_queue = _s.sub_queue)
+      where rq.ev_id is null;
+
+    GET DIAGNOSTICS _cnt = ROW_COUNT;
+    return _cnt;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.finish_batch(
+    x_batch_id bigint)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.finish_batch(1)
+--
+--      Closes a batch.  No more operations can be done with events
+--      of this batch.
+--
+-- Parameters:
+--      x_batch_id      - id of batch.
+--
+-- Returns:
+--      1 if batch was found, 0 otherwise.
+-- Calls:
+--      None
+-- Tables directly manipulated:
+--      update - pgque.subscription
+-- ----------------------------------------------------------------------
+begin
+    update pgque.subscription
+        set sub_active = now(),
+            sub_last_tick = sub_next_tick,
+            sub_next_tick = null,
+            sub_batch = null
+        where sub_batch = x_batch_id;
+    if not found then
+        raise warning 'finish_batch: batch % not found', x_batch_id;
+        return 0;
+    end if;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+drop function if exists pgque.get_queue_info();
+drop function if exists pgque.get_queue_info(text);
+
+create or replace function pgque.get_queue_info(
+    out queue_name                  text,
+    out queue_ntables               integer,
+    out queue_cur_table             integer,
+    out queue_rotation_period       interval,
+    out queue_switch_time           timestamptz,
+    out queue_external_ticker       boolean,
+    out queue_ticker_paused         boolean,
+    out queue_ticker_max_count      integer,
+    out queue_ticker_max_lag        interval,
+    out queue_ticker_idle_period    interval,
+    out ticker_lag                  interval,
+    out ev_per_sec                  float8,
+    out ev_new                      bigint,
+    out last_tick_id                bigint)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_queue_info(0)
+--
+--      Get info about all queues.
+--
+-- Returns:
+--      List of pgque.ret_queue_info records.
+--     queue_name                  - queue name
+--     queue_ntables               - number of tables in this queue
+--     queue_cur_table             - ???
+--     queue_rotation_period       - how often the event_N_M tables in this queue are rotated
+--     queue_switch_time           - ??? when was this queue last rotated
+--     queue_external_ticker       - ???
+--     queue_ticker_paused         - ??? is ticker paused in this queue
+--     queue_ticker_max_count      - max number of events before a tick is issued
+--     queue_ticker_max_lag        - maks time without a tick
+--     queue_ticker_idle_period    - how often the ticker should check this queue
+--     ticker_lag                  - time from last tick
+--     ev_per_sec                  - how many events per second this queue serves
+--     ev_new                      - ???
+--     last_tick_id                - last tick id for this queue
+--
+-- ----------------------------------------------------------------------
+begin
+    for queue_name, queue_ntables, queue_cur_table, queue_rotation_period,
+        queue_switch_time, queue_external_ticker, queue_ticker_paused,
+        queue_ticker_max_count, queue_ticker_max_lag, queue_ticker_idle_period,
+        ticker_lag, ev_per_sec, ev_new, last_tick_id
+    in select
+        f.queue_name, f.queue_ntables, f.queue_cur_table, f.queue_rotation_period,
+        f.queue_switch_time, f.queue_external_ticker, f.queue_ticker_paused,
+        f.queue_ticker_max_count, f.queue_ticker_max_lag, f.queue_ticker_idle_period,
+        f.ticker_lag, f.ev_per_sec, f.ev_new, f.last_tick_id
+        from pgque.get_queue_info(null) f
+    loop
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.get_queue_info(
+    in i_queue_name                 text,
+    out queue_name                  text,
+    out queue_ntables               integer,
+    out queue_cur_table             integer,
+    out queue_rotation_period       interval,
+    out queue_switch_time           timestamptz,
+    out queue_external_ticker       boolean,
+    out queue_ticker_paused         boolean,
+    out queue_ticker_max_count      integer,
+    out queue_ticker_max_lag        interval,
+    out queue_ticker_idle_period    interval,
+    out ticker_lag                  interval,
+    out ev_per_sec                  float8,
+    out ev_new                      bigint,
+    out last_tick_id                bigint)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_queue_info(1)
+--
+--      Get info about particular queue.
+--
+-- Returns:
+--      One pgque.ret_queue_info record.
+--      contente same as forpgque.get_queue_info() 
+-- ----------------------------------------------------------------------
+declare
+    _ticker_lag interval;
+    _top_tick_id bigint;
+    _ht_tick_id bigint;
+    _top_tick_time timestamptz;
+    _top_tick_event_seq bigint;
+    _ht_tick_time timestamptz;
+    _ht_tick_event_seq bigint;
+    _queue_id integer;
+    _queue_event_seq text;
+begin
+    for queue_name, queue_ntables, queue_cur_table, queue_rotation_period,
+        queue_switch_time, queue_external_ticker, queue_ticker_paused,
+        queue_ticker_max_count, queue_ticker_max_lag, queue_ticker_idle_period,
+        _queue_id, _queue_event_seq
+    in select
+        q.queue_name, q.queue_ntables, q.queue_cur_table,
+        q.queue_rotation_period, q.queue_switch_time,
+        q.queue_external_ticker, q.queue_ticker_paused,
+        q.queue_ticker_max_count, q.queue_ticker_max_lag,
+        q.queue_ticker_idle_period,
+        q.queue_id, q.queue_event_seq
+        from pgque.queue q
+        where (i_queue_name is null or q.queue_name = i_queue_name)
+        order by q.queue_name
+    loop
+        -- most recent tick
+        select (current_timestamp - t.tick_time),
+               tick_id, t.tick_time, t.tick_event_seq
+            into ticker_lag, _top_tick_id, _top_tick_time, _top_tick_event_seq
+            from pgque.tick t
+            where t.tick_queue = _queue_id
+            order by t.tick_queue desc, t.tick_id desc
+            limit 1;
+        -- slightly older tick
+        select ht.tick_id, ht.tick_time, ht.tick_event_seq
+            into _ht_tick_id, _ht_tick_time, _ht_tick_event_seq
+            from pgque.tick ht
+            where ht.tick_queue = _queue_id
+             and ht.tick_id >= _top_tick_id - 20
+            order by ht.tick_queue asc, ht.tick_id asc
+            limit 1;
+        if _ht_tick_time < _top_tick_time then
+            ev_per_sec = (_top_tick_event_seq - _ht_tick_event_seq) / extract(epoch from (_top_tick_time - _ht_tick_time));
+        else
+            ev_per_sec = null;
+        end if;
+        ev_new = pgque.seq_getval(_queue_event_seq) - _top_tick_event_seq;
+        last_tick_id = _top_tick_id;
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql;
+
+
+create or replace function pgque.get_consumer_info(
+    out queue_name      text,
+    out consumer_name   text,
+    out lag             interval,
+    out last_seen       interval,
+    out last_tick       bigint,
+    out current_batch   bigint,
+    out next_tick       bigint,
+    out pending_events  bigint)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_consumer_info(0)
+--
+--      Returns info about all consumers on all queues.
+--
+-- Returns:
+--      See pgque.get_consumer_info(2)
+-- ----------------------------------------------------------------------
+begin
+    for queue_name, consumer_name, lag, last_seen,
+        last_tick, current_batch, next_tick, pending_events
+    in
+        select f.queue_name, f.consumer_name, f.lag, f.last_seen,
+               f.last_tick, f.current_batch, f.next_tick, f.pending_events
+            from pgque.get_consumer_info(null, null) f
+    loop
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+
+create or replace function pgque.get_consumer_info(
+    in i_queue_name     text,
+    out queue_name      text,
+    out consumer_name   text,
+    out lag             interval,
+    out last_seen       interval,
+    out last_tick       bigint,
+    out current_batch   bigint,
+    out next_tick       bigint,
+    out pending_events  bigint)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_consumer_info(1)
+--
+--      Returns info about all consumers on single queue.
+--
+-- Returns:
+--      See pgque.get_consumer_info(2)
+-- ----------------------------------------------------------------------
+begin
+    for queue_name, consumer_name, lag, last_seen,
+        last_tick, current_batch, next_tick, pending_events
+    in
+        select f.queue_name, f.consumer_name, f.lag, f.last_seen,
+               f.last_tick, f.current_batch, f.next_tick, f.pending_events
+            from pgque.get_consumer_info(i_queue_name, null) f
+    loop
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+
+create or replace function pgque.get_consumer_info(
+    in i_queue_name     text,
+    in i_consumer_name  text,
+    out queue_name      text,
+    out consumer_name   text,
+    out lag             interval,
+    out last_seen       interval,
+    out last_tick       bigint,
+    out current_batch   bigint,
+    out next_tick       bigint,
+    out pending_events  bigint)
+returns setof record as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_consumer_info(2)
+--
+--      Get info about particular consumer on particular queue.
+--
+-- Parameters:
+--      i_queue_name        - name of a queue. (null = all)
+--      i_consumer_name     - name of a consumer (null = all)
+--
+-- Returns:
+--      queue_name          - Queue name
+--      consumer_name       - Consumer name
+--      lag                 - How old are events the consumer is processing
+--      last_seen           - When the consumer seen by pgq
+--      last_tick           - Tick ID of last processed tick
+--      current_batch       - Current batch ID, if one is active or NULL
+--      next_tick           - If batch is active, then its final tick.
+-- ----------------------------------------------------------------------
+declare
+    _pending_events bigint;
+    _queue_id bigint;
+begin
+    for queue_name, consumer_name, lag, last_seen,
+        last_tick, current_batch, next_tick, _pending_events, _queue_id
+    in
+        select q.queue_name, c.co_name,
+               current_timestamp - t.tick_time,
+               current_timestamp - s.sub_active,
+               s.sub_last_tick, s.sub_batch, s.sub_next_tick,
+               t.tick_event_seq, q.queue_id
+          from pgque.queue q,
+               pgque.consumer c,
+               pgque.subscription s
+               left join pgque.tick t
+                 on (t.tick_queue = s.sub_queue and t.tick_id = s.sub_last_tick)
+         where q.queue_id = s.sub_queue
+           and c.co_id = s.sub_consumer
+           and (i_queue_name is null or q.queue_name = i_queue_name)
+           and (i_consumer_name is null or c.co_name = i_consumer_name)
+         order by 1,2
+    loop
+        select t.tick_event_seq - _pending_events
+            into pending_events
+            from pgque.tick t
+            where t.tick_queue = _queue_id
+            order by t.tick_queue desc, t.tick_id desc
+            limit 1;
+        return next;
+    end loop;
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.get_batch_info(
+    in x_batch_id       bigint,
+    out queue_name      text,
+    out consumer_name   text,
+    out batch_start     timestamptz,
+    out batch_end       timestamptz,
+    out prev_tick_id    bigint,
+    out tick_id         bigint,
+    out lag             interval,
+    out seq_start       bigint,
+    out seq_end         bigint)
+as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.get_batch_info(1)
+--
+--      Returns detailed info about a batch.
+--
+-- Parameters:
+--      x_batch_id      - id of a active batch.
+--
+-- Returns: ??? pls check
+--      queue_name      - which queue this batch came from
+--      consumer_name   - batch processed by
+--      batch_start     - start time of batch
+--      batch_end       - end time of batch
+--      prev_tick_id    - start tick for this batch
+--      tick_id         - end tick for this batch
+--      lag             - now() - tick_id.time 
+--      seq_start       - start event id for batch
+--      seq_end         - end event id for batch
+-- ----------------------------------------------------------------------
+begin
+    select q.queue_name, c.co_name,
+           prev.tick_time, cur.tick_time,
+           s.sub_last_tick, s.sub_next_tick,
+           current_timestamp - cur.tick_time,
+           prev.tick_event_seq, cur.tick_event_seq
+        into queue_name, consumer_name, batch_start, batch_end,
+             prev_tick_id, tick_id, lag, seq_start, seq_end
+        from pgque.subscription s, pgque.tick cur, pgque.tick prev,
+             pgque.queue q, pgque.consumer c
+        where s.sub_batch = x_batch_id
+          and prev.tick_id = s.sub_last_tick
+          and prev.tick_queue = s.sub_queue
+          and cur.tick_id = s.sub_next_tick
+          and cur.tick_queue = s.sub_queue
+          and q.queue_id = s.sub_queue
+          and c.co_id = s.sub_consumer;
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- ======================================================================
+-- Section 3: PL/pgSQL event insertion (derived from PgQ)
+-- Origin: pgq/lowlevel_pl/insert_event.sql
+-- PgQue transformations: schema rename, txid→pg_* renames, search_path
+-- ======================================================================
+
+
+-- ----------------------------------------------------------------------
+-- Function: pgque.insert_event_raw(11)
+--
+--      Actual event insertion.  Used also by retry queue maintenance.
+--
+-- Parameters:
+--      queue_name      - Name of the queue
+--      ev_id           - Event ID.  If NULL, will be taken from seq.
+--      ev_time         - Event creation time.
+--      ev_owner        - Subscription ID when retry event. If NULL, the event is for everybody.
+--      ev_retry        - Retry count. NULL for first-time events.
+--      ev_type         - user data
+--      ev_data         - user data
+--      ev_extra1       - user data
+--      ev_extra2       - user data
+--      ev_extra3       - user data
+--      ev_extra4       - user data
+--
+-- Returns:
+--      Event ID.
+-- ----------------------------------------------------------------------
+create or replace function pgque.insert_event_raw(
+    queue_name text, ev_id bigint, ev_time timestamptz,
+    ev_owner integer, ev_retry integer, ev_type text, ev_data text,
+    ev_extra1 text, ev_extra2 text, ev_extra3 text, ev_extra4 text)
+returns int8 as $$
+declare
+    qstate record;
+    _qname text;
+begin
+    _qname := queue_name;
+    select q.queue_id,
+        pgque.quote_fqname(q.queue_data_pfx || '_' || q.queue_cur_table::text) as cur_table_name,
+        nextval(q.queue_event_seq) as next_ev_id,
+        q.queue_disable_insert
+    from pgque.queue q where q.queue_name = _qname into qstate;
+
+    if not found then
+        raise exception 'queue not found: %', _qname;
+    end if;
+
+    if ev_id is null then
+        ev_id := qstate.next_ev_id;
+    end if;
+
+    if qstate.queue_disable_insert then
+        if current_setting('session_replication_role') <> 'replica' then
+            raise exception 'Insert into queue disallowed';
+        end if;
+    end if;
+
+    execute 'insert into ' || qstate.cur_table_name
+        || ' (ev_id, ev_time, ev_owner, ev_retry,'
+        || ' ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4)'
+        || 'values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)'
+        using ev_id, ev_time, ev_owner, ev_retry,
+              ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4;
+
+    return ev_id;
+end;
+$$ language plpgsql;
+
+-- ======================================================================
+-- Section 4: Trigger functions (derived from PgQ)
+-- Origin: pgq/lowlevel_pl/{jsontriga,logutriga,sqltriga}.sql
+-- PgQue transformations: schema rename, search_path hardening
+-- ======================================================================
+
+create or replace function pgque.jsontriga() returns trigger as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.jsontriga()
+--
+--      Trigger function that puts row data in JSON-encoded form into queue.
+--
+-- Purpose:
+--      Convert row data into easily parseable form.
+--
+-- Trigger parameters:
+--      arg1 - queue name
+--      argX - any number of optional arg, in any order
+--
+-- Optional arguments:
+--      SKIP                - The actual operation should be skipped (BEFORE trigger)
+--      ignore=col1[,col2]  - don't look at the specified arguments
+--      pkey=col1[,col2]    - Set pkey fields for the table, autodetection will be skipped
+--      backup              - Put urlencoded contents of old row to ev_extra2
+--      colname=EXPR        - Override field value with SQL expression.  Can reference table
+--                            columns.  colname can be: ev_type, ev_data, ev_extra1 .. ev_extra4
+--      when=EXPR           - If EXPR returns false, don't insert event.
+--
+-- Queue event fields:
+--      ev_type      - I/U/D ':' pkey_column_list
+--      ev_data      - column values urlencoded
+--      ev_extra1    - table name
+--      ev_extra2    - optional urlencoded backup
+--
+-- Regular listen trigger example:
+-- >   CREATE TRIGGER triga_nimi AFTER INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.jsontriga('qname');
+--
+-- Redirect trigger example:
+-- >   CREATE TRIGGER triga_nimi BEFORE INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.jsontriga('qname', 'SKIP');
+-- ----------------------------------------------------------------------
+declare
+    qname text;
+    ev_type text;
+    ev_data text;
+    ev_extra1 text;
+    ev_extra2 text;
+    ev_extra3 text;
+    ev_extra4 text;
+    do_skip boolean := false;
+    do_backup boolean := false;
+    do_insert boolean := true;
+    do_deny boolean := false;
+    extra_ignore_list text[];
+    full_ignore_list text[];
+    ignore_list text[] := '{}';
+    pkey_list text[];
+    pkey_str text;
+    field_sql_sfx text;
+    field_sql text[] := '{}';
+    data_sql text;
+    ignore_col_changes int4 := 0;
+begin
+    if TG_NARGS < 1 then
+        raise exception 'Trigger needs queue name';
+    end if;
+    qname := TG_ARGV[0];
+
+    -- standard output
+    ev_extra1 := TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME;
+
+    -- prepare to handle magic fields
+    field_sql_sfx := ')::text as val from (select $1.*) r';
+    extra_ignore_list := array['_pgq_ev_type', '_pgq_ev_extra1', '_pgq_ev_extra2',
+                               '_pgq_ev_extra3', '_pgq_ev_extra4']::text[];
+
+    -- parse trigger args
+    declare
+        got boolean;
+        argpair text[];
+        i integer;
+    begin
+        for i in 1 .. TG_NARGS-1 loop
+            if TG_ARGV[i] in ('skip', 'SKIP') then
+                do_skip := true;
+            elsif TG_ARGV[i] = 'backup' then
+                do_backup := true;
+            elsif TG_ARGV[i] = 'deny' then
+                do_deny := true;
+            else
+                got := false;
+                for argpair in select regexp_matches(TG_ARGV[i], '^([^=]+)=(.*)') loop
+                    got := true;
+                    if argpair[1] = 'pkey' then
+                        pkey_str := argpair[2];
+                        pkey_list := string_to_array(pkey_str, ',');
+                    elsif argpair[1] = 'ignore' then
+                        ignore_list := string_to_array(argpair[2], ',');
+                    elsif argpair[1] ~ '^ev_(type|extra[1-4])$' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (' || argpair[2] || field_sql_sfx);
+                    elsif argpair[1] = 'when' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (case when (' || argpair[2]
+                                                  || ')::boolean then ''proceed'' else null end' || field_sql_sfx);
+                    else
+                        got := false;
+                    end if;
+                end loop;
+                if not got then
+                    raise exception 'bad argument: %', TG_ARGV[i];
+                end if;
+            end if;
+        end loop;
+    end;
+
+    full_ignore_list := ignore_list || extra_ignore_list;
+
+    if pkey_str is null then
+        select array_agg(pk.attname)
+            from (select k.attname from pg_index i, pg_attribute k
+                    where i.indrelid = TG_RELID
+                        and k.attrelid = i.indexrelid and i.indisprimary
+                        and k.attnum > 0 and not k.attisdropped
+                    order by k.attnum) pk
+            into pkey_list;
+        if pkey_list is null then
+            pkey_list := '{}';
+            pkey_str := '';
+        else
+            pkey_str := array_to_string(pkey_list, ',');
+        end if;
+    end if;
+    if pkey_str = '' and TG_OP in ('UPDATE', 'DELETE') then
+        raise exception 'Update/Delete on table without pkey';
+    end if;
+
+    if TG_OP not in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE') then
+        raise exception 'TG_OP not supported: %', TG_OP;
+    end if;
+
+    -- fill ev_type
+    select to_json(t.*)::text
+        from (select TG_OP as op, array[TG_TABLE_SCHEMA,TG_TABLE_NAME] as "table", pkey_list as "pkey") t
+        into ev_type;
+
+    -- early exit?
+    if current_setting('session_replication_role') = 'local' then
+        if TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+            return null;
+        elsif TG_OP = 'DELETE' then
+            return OLD;
+        else
+            return NEW;
+        end if;
+    elsif do_deny then
+        raise exception 'Table ''%.%'' to queue ''%'': change not allowed (%)',
+                    TG_TABLE_SCHEMA, TG_TABLE_NAME, qname, TG_OP;
+    elsif TG_OP = 'TRUNCATE' then
+        perform pgque.insert_event(qname, ev_type, '{}', ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+        return null;
+    end if;
+
+    -- process table columns
+    declare
+        attr record;
+        pkey_sql_buf text[];
+        qcol text;
+        data_sql_buf text[];
+        ignore_sql text;
+        ignore_sql_buf text[];
+        pkey_change_sql text;
+        pkey_col_changes int4 := 0;
+        valexp text;
+    begin
+        for attr in
+            select k.attnum, k.attname, k.atttypid
+                from pg_attribute k
+                where k.attrelid = TG_RELID and k.attnum > 0 and not k.attisdropped
+                order by k.attnum
+        loop
+            qcol := quote_ident(attr.attname);
+            if attr.attname = any (ignore_list) then
+                ignore_sql_buf := array_append(ignore_sql_buf,
+                    'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+                continue;
+            elsif attr.attname = any (extra_ignore_list) then
+                field_sql := array_prepend('select ' || quote_literal(substring(attr.attname from 6))
+                                           || '::text as key, (r.' || qcol || field_sql_sfx, field_sql);
+                continue;
+            end if;
+
+            -- force cast to text or not
+            if attr.atttypid in ('timestamptz'::regtype::oid, 'timestamp'::regtype::oid,
+                    'int8'::regtype::oid, 'int4'::regtype::oid, 'int2'::regtype::oid,
+                    'date'::regtype::oid, 'boolean'::regtype::oid) then
+                valexp := 'to_json(r.' || qcol || ')::text';
+            else
+                valexp := 'to_json(r.' || qcol || '::text)::text';
+            end if;
+
+            if attr.attname = any (pkey_list) then
+                pkey_sql_buf := array_append(pkey_sql_buf,
+                        'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+            end if;
+
+            data_sql_buf := array_append(data_sql_buf,
+                    'select ' || quote_literal(to_json(attr.attname) || ':')
+                    || ' || coalesce(' || valexp || ', ''null'') as jpair from (select $1.*) r');
+        end loop;
+
+        -- SQL to see if pkey columns have changed
+        if TG_OP = 'UPDATE' then
+            pkey_change_sql := 'select count(1) from (' || array_to_string(pkey_sql_buf, ' union all ')
+                            || ') cols where cols.is_changed';
+            execute pkey_change_sql using OLD, NEW into pkey_col_changes;
+            if pkey_col_changes > 0 then
+                raise exception 'primary key update not allowed';
+            end if;
+        end if;
+
+        -- SQL to see if ignored columns have changed
+        if TG_OP = 'UPDATE' and array_length(ignore_list, 1) is not null then
+            ignore_sql := 'select count(1) from (' || array_to_string(ignore_sql_buf, ' union all ')
+                || ') cols where cols.is_changed';
+            execute ignore_sql using OLD, NEW into ignore_col_changes;
+        end if;
+
+        -- SQL to load data
+        data_sql := 'select ''{'' || array_to_string(array_agg(cols.jpair), '','') || ''}'' from ('
+                 || array_to_string(data_sql_buf, ' union all ') || ') cols';
+    end;
+
+    -- render data
+    declare
+        old_data text;
+    begin
+        if TG_OP = 'INSERT' then
+            execute data_sql using NEW into ev_data;
+        elsif TG_OP = 'UPDATE' then
+
+            -- render NEW
+            execute data_sql using NEW into ev_data;
+
+            -- render OLD when needed
+            if do_backup or array_length(ignore_list, 1) is not null then
+                execute data_sql using OLD into old_data;
+            end if;
+
+            -- only change was to ignored columns?
+            if old_data = ev_data and ignore_col_changes > 0 then
+                do_insert := false;
+            end if;
+
+            -- is backup needed?
+            if do_backup then
+                ev_extra2 := old_data;
+            end if;
+        elsif TG_OP = 'DELETE' then
+            execute data_sql using OLD into ev_data;
+        end if;
+    end;
+
+    -- apply magic args and columns
+    declare
+        col text;
+        val text;
+        rmain record;
+        sql text;
+    begin
+        if do_insert and array_length(field_sql, 1) is not null then
+            if TG_OP = 'DELETE' then
+                rmain := OLD;
+            else
+                rmain := NEW;
+            end if;
+
+            sql := array_to_string(field_sql, ' union all ');
+            for col, val in
+                execute sql using rmain
+            loop
+                if col = 'ev_type' then
+                    ev_type := val;
+                elsif col = 'ev_extra1' then
+                    ev_extra1 := val;
+                elsif col = 'ev_extra2' then
+                    ev_extra2 := val;
+                elsif col = 'ev_extra3' then
+                    ev_extra3 := val;
+                elsif col = 'ev_extra4' then
+                    ev_extra4 := val;
+                elsif col = 'when' then
+                    if val is null then
+                        do_insert := false;
+                    end if;
+                end if;
+            end loop;
+        end if;
+    end;
+
+    -- insert final values
+    if do_insert then
+        perform pgque.insert_event(qname, ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+    end if;
+
+    if do_skip or TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+        return null;
+    elsif TG_OP = 'DELETE' then
+        return OLD;
+    else
+        return NEW;
+    end if;
+end;
+$$ language plpgsql;
+
+create or replace function pgque.logutriga() returns trigger as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.logutriga()
+--
+--      Trigger function that puts row data in urlencoded form into queue.
+--
+-- Purpose:
+--	Used as producer for several PgQ standard consumers (cube_dispatcher, 
+--      queue_mover, table_dispatcher).  Basically for cases where the
+--      consumer wants to parse the event and look at the actual column values.
+--
+-- Trigger parameters:
+--      arg1 - queue name
+--      argX - any number of optional arg, in any order
+--
+-- Optional arguments:
+--      SKIP                - The actual operation should be skipped (BEFORE trigger)
+--      ignore=col1[,col2]  - don't look at the specified arguments
+--      pkey=col1[,col2]    - Set pkey fields for the table, autodetection will be skipped
+--      backup              - Put urlencoded contents of old row to ev_extra2
+--      colname=EXPR        - Override field value with SQL expression.  Can reference table
+--                            columns.  colname can be: ev_type, ev_data, ev_extra1 .. ev_extra4
+--      when=EXPR           - If EXPR returns false, don't insert event.
+--
+-- Queue event fields:
+--      ev_type      - I/U/D ':' pkey_column_list
+--      ev_data      - column values urlencoded
+--      ev_extra1    - table name
+--      ev_extra2    - optional urlencoded backup
+--
+-- Regular listen trigger example:
+-- >   CREATE TRIGGER triga_nimi AFTER INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.logutriga('qname');
+--
+-- Redirect trigger example:
+-- >   CREATE TRIGGER triga_nimi BEFORE INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.logutriga('qname', 'SKIP');
+-- ----------------------------------------------------------------------
+declare
+    qname text;
+    ev_type text;
+    ev_data text;
+    ev_extra1 text;
+    ev_extra2 text;
+    ev_extra3 text;
+    ev_extra4 text;
+    do_skip boolean := false;
+    do_backup boolean := false;
+    do_insert boolean := true;
+    do_deny boolean := false;
+    extra_ignore_list text[];
+    full_ignore_list text[];
+    ignore_list text[] := '{}';
+    pkey_list text[];
+    pkey_str text;
+    field_sql_sfx text;
+    field_sql text[] := '{}';
+    data_sql text;
+    ignore_col_changes int4 := 0;
+begin
+    if TG_NARGS < 1 then
+        raise exception 'Trigger needs queue name';
+    end if;
+    qname := TG_ARGV[0];
+
+    -- standard output
+    ev_extra1 := TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME;
+
+    -- prepare to handle magic fields
+    field_sql_sfx := ')::text as val from (select $1.*) r';
+    extra_ignore_list := array['_pgq_ev_type', '_pgq_ev_extra1', '_pgq_ev_extra2',
+                               '_pgq_ev_extra3', '_pgq_ev_extra4']::text[];
+
+    -- parse trigger args
+    declare
+        got boolean;
+        argpair text[];
+        i integer;
+    begin
+        for i in 1 .. TG_NARGS-1 loop
+            if TG_ARGV[i] in ('skip', 'SKIP') then
+                do_skip := true;
+            elsif TG_ARGV[i] = 'backup' then
+                do_backup := true;
+            elsif TG_ARGV[i] = 'deny' then
+                do_deny := true;
+            else
+                got := false;
+                for argpair in select regexp_matches(TG_ARGV[i], '^([^=]+)=(.*)') loop
+                    got := true;
+                    if argpair[1] = 'pkey' then
+                        pkey_str := argpair[2];
+                        pkey_list := string_to_array(pkey_str, ',');
+                    elsif argpair[1] = 'ignore' then
+                        ignore_list := string_to_array(argpair[2], ',');
+                    elsif argpair[1] ~ '^ev_(type|extra[1-4])$' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (' || argpair[2] || field_sql_sfx);
+                    elsif argpair[1] = 'when' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (case when (' || argpair[2]
+                                                  || ')::boolean then ''proceed'' else null end' || field_sql_sfx);
+                    else
+                        got := false;
+                    end if;
+                end loop;
+                if not got then
+                    raise exception 'bad argument: %', TG_ARGV[i];
+                end if;
+            end if;
+        end loop;
+    end;
+
+    full_ignore_list := ignore_list || extra_ignore_list;
+
+    if pkey_str is null then
+        select array_agg(pk.attname)
+            from (select k.attname from pg_index i, pg_attribute k
+                    where i.indrelid = TG_RELID
+                        and k.attrelid = i.indexrelid and i.indisprimary
+                        and k.attnum > 0 and not k.attisdropped
+                    order by k.attnum) pk
+            into pkey_list;
+        if pkey_list is null then
+            pkey_list := '{}';
+            pkey_str := '';
+        else
+            pkey_str := array_to_string(pkey_list, ',');
+        end if;
+    end if;
+    if pkey_str = '' and TG_OP in ('UPDATE', 'DELETE') then
+        raise exception 'Update/Delete on table without pkey';
+    end if;
+
+    if TG_OP = 'INSERT' then
+        ev_type := 'I:' || pkey_str;
+    elsif TG_OP = 'UPDATE' then
+        ev_type := 'U:' || pkey_str;
+    elsif TG_OP = 'DELETE' then
+        ev_type := 'D:' || pkey_str;
+    elsif TG_OP = 'TRUNCATE' then
+        ev_type := 'R';
+    else
+        raise exception 'TG_OP not supported: %', TG_OP;
+    end if;
+
+    if current_setting('session_replication_role') = 'local' then
+        if TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+            return null;
+        elsif TG_OP = 'DELETE' then
+            return OLD;
+        else
+            return NEW;
+        end if;
+    elsif do_deny then
+        raise exception 'Table ''%.%'' to queue ''%'': change not allowed (%)',
+                    TG_TABLE_SCHEMA, TG_TABLE_NAME, qname, TG_OP;
+    elsif TG_OP = 'TRUNCATE' then
+        perform pgque.insert_event(qname, ev_type, '', ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+        return null;
+    end if;
+
+    -- process table columns
+    declare
+        attr record;
+        pkey_sql_buf text[];
+        qcol text;
+        data_sql_buf text[];
+        ignore_sql text;
+        ignore_sql_buf text[];
+        pkey_change_sql text;
+        pkey_col_changes int4 := 0;
+        valexp text;
+    begin
+        for attr in
+            select k.attnum, k.attname, k.atttypid
+                from pg_attribute k
+                where k.attrelid = TG_RELID and k.attnum > 0 and not k.attisdropped
+                order by k.attnum
+        loop
+            qcol := quote_ident(attr.attname);
+            if attr.attname = any (ignore_list) then
+                ignore_sql_buf := array_append(ignore_sql_buf,
+                    'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+                continue;
+            elsif attr.attname = any (extra_ignore_list) then
+                field_sql := array_prepend('select ' || quote_literal(substring(attr.attname from 6))
+                                           || '::text as key, (r.' || qcol || field_sql_sfx, field_sql);
+                continue;
+            end if;
+
+            if attr.atttypid = 'boolean'::regtype::oid then
+                valexp := 'case r.' || qcol || ' when true then ''t'' when false then ''f'' else null end';
+            else
+                valexp := 'r.' || qcol || '::text';
+            end if;
+
+            if attr.attname = any (pkey_list) then
+                pkey_sql_buf := array_append(pkey_sql_buf,
+                        'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+            end if;
+
+            data_sql_buf := array_append(data_sql_buf,
+                    'select pgque._urlencode(' || quote_literal(attr.attname)
+                    || ') || coalesce(''='' || pgque._urlencode(' || valexp
+                    || '), '''') as upair from (select $1.*) r');
+        end loop;
+
+        -- SQL to see if pkey columns have changed
+        if TG_OP = 'UPDATE' then
+            pkey_change_sql := 'select count(1) from (' || array_to_string(pkey_sql_buf, ' union all ')
+                            || ') cols where cols.is_changed';
+            execute pkey_change_sql using OLD, NEW into pkey_col_changes;
+            if pkey_col_changes > 0 then
+                raise exception 'primary key update not allowed';
+            end if;
+        end if;
+
+        -- SQL to see if ignored columns have changed
+        if TG_OP = 'UPDATE' and array_length(ignore_list, 1) is not null then
+            ignore_sql := 'select count(1) from (' || array_to_string(ignore_sql_buf, ' union all ')
+                || ') cols where cols.is_changed';
+            execute ignore_sql using OLD, NEW into ignore_col_changes;
+        end if;
+
+        -- SQL to load data
+        data_sql := 'select array_to_string(array_agg(cols.upair), ''&'') from ('
+                 || array_to_string(data_sql_buf, ' union all ') || ') cols';
+    end;
+
+    -- render data
+    declare
+        old_data text;
+    begin
+        if TG_OP = 'INSERT' then
+            execute data_sql using NEW into ev_data;
+        elsif TG_OP = 'UPDATE' then
+
+            -- render NEW
+            execute data_sql using NEW into ev_data;
+
+            -- render OLD when needed
+            if do_backup or array_length(ignore_list, 1) is not null then
+                execute data_sql using OLD into old_data;
+            end if;
+
+            -- only change was to ignored columns?
+            if old_data = ev_data and ignore_col_changes > 0 then
+                do_insert := false;
+            end if;
+
+            -- is backup needed?
+            if do_backup then
+                ev_extra2 := old_data;
+            end if;
+        elsif TG_OP = 'DELETE' then
+            execute data_sql using OLD into ev_data;
+        end if;
+    end;
+
+    -- apply magic args and columns
+    declare
+        col text;
+        val text;
+        rmain record;
+        sql text;
+    begin
+        if do_insert and array_length(field_sql, 1) is not null then
+            if TG_OP = 'DELETE' then
+                rmain := OLD;
+            else
+                rmain := NEW;
+            end if;
+
+            sql := array_to_string(field_sql, ' union all ');
+            for col, val in
+                execute sql using rmain
+            loop
+                if col = 'ev_type' then
+                    ev_type := val;
+                elsif col = 'ev_extra1' then
+                    ev_extra1 := val;
+                elsif col = 'ev_extra2' then
+                    ev_extra2 := val;
+                elsif col = 'ev_extra3' then
+                    ev_extra3 := val;
+                elsif col = 'ev_extra4' then
+                    ev_extra4 := val;
+                elsif col = 'when' then
+                    if val is null then
+                        do_insert := false;
+                    end if;
+                end if;
+            end loop;
+        end if;
+    end;
+
+    -- insert final values
+    if do_insert then
+        perform pgque.insert_event(qname, ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+    end if;
+
+    if do_skip or TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+        return null;
+    elsif TG_OP = 'DELETE' then
+        return OLD;
+    else
+        return NEW;
+    end if;
+end;
+$$ language plpgsql;
+
+create or replace function pgque._urlencode(val text)
+returns text as $$
+    select replace(string_agg(pair[1] || regexp_replace(encode(convert_to(pair[2], 'utf8'), 'hex'), '..', E'%\\&', 'g'), ''), '%20', '+')
+        from regexp_matches($1, '([-_.a-zA-Z0-9]*)([^-_.a-zA-Z0-9]*)', 'g') pair
+$$ language sql strict immutable;
+
+create or replace function pgque.sqltriga() returns trigger as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.sqltriga()
+--
+--      Trigger function that puts row data in SQL-fragment form into queue.
+--
+-- Purpose:
+--      Anciant way to implement replication.
+--
+-- Trigger parameters:
+--      arg1 - queue name
+--      argX - any number of optional arg, in any order
+--
+-- Optional arguments:
+--      SKIP                - The actual operation should be skipped (BEFORE trigger)
+--      ignore=col1[,col2]  - don't look at the specified arguments
+--      pkey=col1[,col2]    - Set pkey fields for the table, autodetection will be skipped
+--      backup              - Put urlencoded contents of old row to ev_extra2
+--      colname=EXPR        - Override field value with SQL expression.  Can reference table
+--                            columns.  colname can be: ev_type, ev_data, ev_extra1 .. ev_extra4
+--      when=EXPR           - If EXPR returns false, don't insert event.
+--
+-- Queue event fields:
+--      ev_type      - I/U/D ':' pkey_column_list
+--      ev_data      - column values urlencoded
+--      ev_extra1    - table name
+--      ev_extra2    - optional urlencoded backup
+--
+-- Regular listen trigger example:
+-- >   CREATE TRIGGER triga_nimi AFTER INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.logutriga('qname');
+--
+-- Redirect trigger example:
+-- >   CREATE TRIGGER triga_nimi BEFORE INSERT OR UPDATE ON customer
+-- >   FOR EACH ROW EXECUTE PROCEDURE pgque.logutriga('qname', 'SKIP');
+-- ----------------------------------------------------------------------
+declare
+    qname text;
+    ev_type text;
+    ev_data text;
+    ev_extra1 text;
+    ev_extra2 text;
+    ev_extra3 text;
+    ev_extra4 text;
+    do_skip boolean := false;
+    do_backup boolean := false;
+    do_insert boolean := true;
+    do_deny boolean := false;
+    extra_ignore_list text[];
+    full_ignore_list text[];
+    ignore_list text[] := '{}';
+    pkey_list text[];
+    pkey_str text;
+    field_sql_sfx text;
+    field_sql text[] := '{}';
+    data_sql text;
+    ignore_col_changes int4 := 0;
+begin
+    if TG_NARGS < 1 then
+        raise exception 'Trigger needs queue name';
+    end if;
+    qname := TG_ARGV[0];
+
+    -- standard output
+    ev_extra1 := TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME;
+
+    -- prepare to handle magic fields
+    field_sql_sfx := ')::text as val from (select $1.*) r';
+    extra_ignore_list := array['_pgq_ev_type', '_pgq_ev_extra1', '_pgq_ev_extra2',
+                               '_pgq_ev_extra3', '_pgq_ev_extra4']::text[];
+
+    -- parse trigger args
+    declare
+        got boolean;
+        argpair text[];
+        i integer;
+    begin
+        for i in 1 .. TG_NARGS-1 loop
+            if TG_ARGV[i] in ('skip', 'SKIP') then
+                do_skip := true;
+            elsif TG_ARGV[i] = 'backup' then
+                do_backup := true;
+            elsif TG_ARGV[i] = 'deny' then
+                do_deny := true;
+            else
+                got := false;
+                for argpair in select regexp_matches(TG_ARGV[i], '^([^=]+)=(.*)') loop
+                    got := true;
+                    if argpair[1] = 'pkey' then
+                        pkey_str := argpair[2];
+                        pkey_list := string_to_array(pkey_str, ',');
+                    elsif argpair[1] = 'ignore' then
+                        ignore_list := string_to_array(argpair[2], ',');
+                    elsif argpair[1] ~ '^ev_(type|extra[1-4])$' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (' || argpair[2] || field_sql_sfx);
+                    elsif argpair[1] = 'when' then
+                        field_sql := array_append(field_sql, 'select ' || quote_literal(argpair[1])
+                                                  || '::text as key, (case when (' || argpair[2]
+                                                  || ')::boolean then ''proceed'' else null end' || field_sql_sfx);
+                    else
+                        got := false;
+                    end if;
+                end loop;
+                if not got then
+                    raise exception 'bad argument: %', TG_ARGV[i];
+                end if;
+            end if;
+        end loop;
+    end;
+
+    full_ignore_list := ignore_list || extra_ignore_list;
+
+    if pkey_str is null then
+        select array_agg(pk.attname)
+            from (select k.attname from pg_index i, pg_attribute k
+                    where i.indrelid = TG_RELID
+                        and k.attrelid = i.indexrelid and i.indisprimary
+                        and k.attnum > 0 and not k.attisdropped
+                    order by k.attnum) pk
+            into pkey_list;
+        if pkey_list is null then
+            pkey_list := '{}';
+            pkey_str := '';
+        else
+            pkey_str := array_to_string(pkey_list, ',');
+        end if;
+    end if;
+    if pkey_str = '' and TG_OP in ('UPDATE', 'DELETE') then
+        raise exception 'Update/Delete on table without pkey';
+    end if;
+
+    if TG_OP = 'INSERT' then
+        ev_type := 'I';
+    elsif TG_OP = 'UPDATE' then
+        ev_type := 'U';
+    elsif TG_OP = 'DELETE' then
+        ev_type := 'D';
+    elsif TG_OP = 'TRUNCATE' then
+        ev_type := 'R';
+    else
+        raise exception 'TG_OP not supported: %', TG_OP;
+    end if;
+
+    if current_setting('session_replication_role') = 'local' then
+        if TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+            return null;
+        elsif TG_OP = 'DELETE' then
+            return OLD;
+        else
+            return NEW;
+        end if;
+    elsif do_deny then
+        raise exception 'Table ''%.%'' to queue ''%'': change not allowed (%)',
+                    TG_TABLE_SCHEMA, TG_TABLE_NAME, qname, TG_OP;
+    elsif TG_OP = 'TRUNCATE' then
+        perform pgque.insert_event(qname, ev_type, '', ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+        return null;
+    end if;
+
+    -- process table columns
+    declare
+        attr record;
+        pkey_sql_buf text[];
+        qcol text;
+        data_sql_buf text[];
+        ignore_sql text;
+        ignore_sql_buf text[];
+        pkey_change_sql text;
+        pkey_col_changes int4 := 0;
+        valexp text;
+        sql1_buf text[] := '{}'; -- I:cols, U:vals, D:-
+        sql2_buf text[] := '{}'; -- I:vals, U:pks, D:pks
+        sql1_buf_fallback text[] := '{}';
+        val_sql text;
+        has_changed boolean;
+    begin
+        for attr in
+            select k.attnum, k.attname, k.atttypid
+                from pg_attribute k
+                where k.attrelid = TG_RELID and k.attnum > 0 and not k.attisdropped
+                order by k.attnum
+        loop
+            qcol := quote_ident(attr.attname);
+            if attr.attname = any (ignore_list) then
+                ignore_sql_buf := array_append(ignore_sql_buf,
+                    'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+                continue;
+            elsif attr.attname = any (extra_ignore_list) then
+                field_sql := array_prepend('select ' || quote_literal(substring(attr.attname from 6))
+                                           || '::text as key, (r.' || qcol || field_sql_sfx, field_sql);
+                continue;
+            end if;
+
+            if attr.atttypid = 'boolean'::regtype::oid then
+                valexp := 'case r.' || qcol || ' when true then ''t'' when false then ''f'' else null end';
+            else
+                valexp := 'r.' || qcol || '::text';
+            end if;
+
+            if attr.attname = any (pkey_list) then
+                pkey_sql_buf := array_append(pkey_sql_buf,
+                        'select case when rold.' || qcol || ' is null and rnew.' || qcol || ' is null then false'
+                        || ' when rold.' || qcol || ' is null or rnew.' || qcol || ' is null then true'
+                        || ' else rold.' || qcol || ' <> rnew.' || qcol
+                        || ' end as is_changed '
+                        || 'from (select $1.*) rold, (select $2.*) rnew');
+                if TG_OP in ('UPDATE', 'DELETE') then
+                    sql2_buf := array_append(sql2_buf, 'select ' || quote_literal(qcol)
+                        || ' || coalesce(''='' || quote_literal(' || valexp|| '), '' is null'') as val'
+                        || ' from (select $1.*) r');
+                    if array_length(sql1_buf_fallback, 1) is null then
+                        sql1_buf_fallback := array_append(sql1_buf_fallback, 'select ' || quote_literal(qcol || '=')
+                            || ' || quote_nullable(' || valexp || ') as val'
+                            || ' from (select $1.*) r');
+                    end if;
+                    continue;
+                end if;
+            end if;
+
+            if TG_OP = 'INSERT' then
+                sql1_buf := array_append(sql1_buf, qcol);
+                sql2_buf := array_append(sql2_buf, 'select coalesce(quote_literal(' || valexp || '), ''null'') as val'
+                    || ' from (select $1.*) r');
+            elsif TG_OP = 'UPDATE' then
+                execute 'select quote_nullable(rold.' || qcol || ') <> quote_nullable(rnew.' || qcol || ') as has_changed'
+                    || ' from (select $1.*) rold, (select $2.*) rnew'
+                    using OLD, NEW into has_changed;
+                if has_changed then
+                    sql1_buf := array_append(sql1_buf, 'select ' || quote_literal(qcol || '=')
+                        || ' || quote_nullable(' || valexp || ') as val'
+                        || ' from (select $1.*) r');
+                end if;
+            end if;
+        end loop;
+
+        -- SQL to see if pkey columns have changed
+        if TG_OP = 'UPDATE' then
+            pkey_change_sql := 'select count(1) from (' || array_to_string(pkey_sql_buf, ' union all ')
+                            || ') cols where cols.is_changed';
+            execute pkey_change_sql using OLD, NEW into pkey_col_changes;
+            if pkey_col_changes > 0 then
+                raise exception 'primary key update not allowed';
+            end if;
+        end if;
+
+        -- SQL to see if ignored columns have changed
+        if TG_OP = 'UPDATE' and array_length(ignore_list, 1) is not null then
+            ignore_sql := 'select count(1) from (' || array_to_string(ignore_sql_buf, ' union all ')
+                || ') cols where cols.is_changed';
+            execute ignore_sql using OLD, NEW into ignore_col_changes;
+        end if;
+
+        -- SQL to load data
+        if TG_OP = 'INSERT' then
+            data_sql := 'select array_to_string(array[''('', '
+                || quote_literal(array_to_string(sql1_buf, ','))
+                || ', '') values ('','
+                || '(select array_to_string(array_agg(s.val), '','') from (' || array_to_string(sql2_buf, ' union all ') || ') s)'
+                || ', '')'''
+                || '], '''')';
+        elsif TG_OP = 'UPDATE' then
+            if array_length(sql1_buf, 1) is null then
+                sql1_buf := sql1_buf_fallback;
+            end if;
+            data_sql := 'select array_to_string(array['
+                || '(select array_to_string(array_agg(s.val), '','') from (' || array_to_string(sql1_buf, ' union all ') || ') s)'
+                || ', '' where '','
+                || '(select array_to_string(array_agg(s.val), '' and '') from (' || array_to_string(sql2_buf, ' union all ') || ') s)'
+                || '], '''')';
+        else
+            data_sql := 'select array_to_string(array['
+                || '(select array_to_string(array_agg(s.val), '' and '') from (' || array_to_string(sql2_buf, ' union all ') || ') s)'
+                || '], '''')';
+        end if;
+    end;
+
+    -- render data
+    declare
+        old_data text;
+    begin
+        if TG_OP = 'INSERT' then
+            execute data_sql using NEW into ev_data;
+        elsif TG_OP = 'UPDATE' then
+
+            -- render NEW
+            execute data_sql using NEW into ev_data;
+
+            -- render OLD when needed
+            if do_backup or array_length(ignore_list, 1) is not null then
+                execute data_sql using OLD into old_data;
+            end if;
+
+            -- only change was to ignored columns?
+            if old_data = ev_data and ignore_col_changes > 0 then
+                do_insert := false;
+            end if;
+
+            -- is backup needed?
+            if do_backup then
+                ev_extra2 := old_data;
+            end if;
+        elsif TG_OP = 'DELETE' then
+            execute data_sql using OLD into ev_data;
+        end if;
+    end;
+
+    -- apply magic args and columns
+    declare
+        col text;
+        val text;
+        rmain record;
+        sql text;
+    begin
+        if do_insert and array_length(field_sql, 1) is not null then
+            if TG_OP = 'DELETE' then
+                rmain := OLD;
+            else
+                rmain := NEW;
+            end if;
+
+            sql := array_to_string(field_sql, ' union all ');
+            for col, val in
+                execute sql using rmain
+            loop
+                if col = 'ev_type' then
+                    ev_type := val;
+                elsif col = 'ev_extra1' then
+                    ev_extra1 := val;
+                elsif col = 'ev_extra2' then
+                    ev_extra2 := val;
+                elsif col = 'ev_extra3' then
+                    ev_extra3 := val;
+                elsif col = 'ev_extra4' then
+                    ev_extra4 := val;
+                elsif col = 'when' then
+                    if val is null then
+                        do_insert := false;
+                    end if;
+                end if;
+            end loop;
+        end if;
+    end;
+
+    -- insert final values
+    if do_insert then
+        perform pgque.insert_event(qname, ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4);
+    end if;
+
+    if do_skip or TG_WHEN = 'AFTER' or TG_OP = 'TRUNCATE' then
+        return null;
+    elsif TG_OP = 'DELETE' then
+        return OLD;
+    else
+        return NEW;
+    end if;
+end;
+$$ language plpgsql;
+
+-- ======================================================================
+-- Section 5: Default grants (derived from PgQ)
+-- Origin: pgq/structure/grants.sql
+-- PgQue transformations: pgq_reader/writer/admin → pgque_reader/writer/admin
+-- ======================================================================
+
+
+
+grant usage on schema pgque to public;
+
+-- old default grants
+grant select on table pgque.consumer to public;
+grant select on table pgque.queue to public;
+grant select on table pgque.tick to public;
+grant select on table pgque.queue to public;
+grant select on table pgque.subscription to public;
+grant select on table pgque.event_template to public;
+grant select on table pgque.retry_queue to public;
+
+-- ======================================================================
+-- Section 6: pgque additions (NEW — not derived from PgQ)
+-- ======================================================================
+
+-- pgque-additions/config.sql
+-- pgque.config — singleton configuration table
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+
+create table if not exists pgque.config (
+    singleton       bool primary key default true check (singleton),
+    ticker_job_id   bigint,
+    maint_job_id    bigint,
+    scheduler       text
+        constraint config_scheduler_check
+        check (scheduler in ('pg_cron', 'pg_timetable')),
+    tick_period_ms  integer not null default 100
+        constraint config_tick_period_ms_check
+        check (
+            tick_period_ms between 1 and 1000
+            and case
+                when tick_period_ms between 1 and 1000 then 1000 % tick_period_ms = 0
+                else false
+            end
+        ),
+    installed_at    timestamptz not null default clock_timestamp()
+);
+
+-- Idempotent insert
+insert into pgque.config (singleton) values (true)
+on conflict (singleton) do nothing;
+
+-- Add tick_period_ms on upgrade from a pre-tick-period install.
+do $$
+begin
+    if not exists (
+        select 1 from information_schema.columns
+        where table_schema = 'pgque' and table_name = 'config'
+          and column_name = 'scheduler'
+    ) then
+        alter table pgque.config
+            add column scheduler text;
+    end if;
+
+    alter table pgque.config
+        drop constraint if exists config_scheduler_check;
+    alter table pgque.config
+        add constraint config_scheduler_check
+        check (scheduler in ('pg_cron', 'pg_timetable'));
+
+    if not exists (
+        select 1 from information_schema.columns
+        where table_schema = 'pgque' and table_name = 'config'
+          and column_name = 'tick_period_ms'
+    ) then
+        alter table pgque.config
+            add column tick_period_ms integer not null default 100;
+    end if;
+
+    -- v0.2.0 safety: ticker_loop runs within pg_cron's 1000 ms slot and uses
+    -- integer iteration counts, so only exact divisors of 1000 produce the
+    -- reported cadence. Normalize any pre-constraint experimental value before
+    -- tightening the check.
+    update pgque.config
+       set tick_period_ms = 100
+     where not case
+        when tick_period_ms between 1 and 1000 then 1000 % tick_period_ms = 0
+        else false
+     end;
+
+    alter table pgque.config
+        drop constraint if exists config_tick_period_ms_check;
+    alter table pgque.config
+        add constraint config_tick_period_ms_check
+        check (
+            tick_period_ms between 1 and 1000
+            and case
+                when tick_period_ms between 1 and 1000 then 1000 % tick_period_ms = 0
+                else false
+            end
+        );
+end $$;
+
+-- pgque-additions/queue_max_retries.sql
+-- Add queue_max_retries column to pgque.queue
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- The queue table is defined in PgQ's tables.sql.  After the transformed
+-- PgQ schema is installed, we add this pgque-specific column.
+
+do $$
+begin
+    if not exists (
+        select 1 from information_schema.columns
+        where table_schema = 'pgque' and table_name = 'queue'
+        and column_name = 'queue_max_retries'
+    ) then
+        alter table pgque.queue add column queue_max_retries int4;
+    end if;
+end $$;
+
+-- Override set_queue_config to also accept queue_max_retries.
+--
+-- #100: validate parameter values before writing them to pgque.queue.
+-- The base PgQ implementation accepts any string PostgreSQL can cast to the
+-- column type, so a typo like ticker_max_count=0 or rotation_period=-1h
+-- silently produced broken ticker / rotation behavior. Reject nonsensical
+-- values up front with a clear error.
+create or replace function pgque.set_queue_config(
+    x_queue_name    text,
+    x_param_name    text,
+    x_param_value   text)
+returns integer as $$
+declare
+    v_param_name    text;
+    v_int_val       int8;
+    v_interval_val  interval;
+begin
+    -- discard NULL input
+    if x_queue_name is null or x_param_name is null then
+        raise exception 'Invalid NULL value';
+    end if;
+
+    -- check if queue exists
+    perform 1 from pgque.queue where queue_name = x_queue_name;
+    if not found then
+        raise exception 'No such event queue';
+    end if;
+
+    -- check if valid parameter name
+    v_param_name := 'queue_' || x_param_name;
+    if v_param_name not in (
+        'queue_ticker_max_count',
+        'queue_ticker_max_lag',
+        'queue_ticker_idle_period',
+        'queue_ticker_paused',
+        'queue_rotation_period',
+        'queue_external_ticker',
+        'queue_max_retries')
+    then
+        raise exception 'cannot change parameter "%s"', x_param_name;
+    end if;
+
+    -- Per-parameter semantic validation (#100). Type errors (non-numeric for
+    -- integer params, non-interval for interval params) still surface as
+    -- PostgreSQL cast errors during the UPDATE; this block adds the
+    -- range/sign checks that PG cannot infer from the column type alone.
+    -- NULL values pass through to reset the column to its DEFAULT.
+    if x_param_value is not null then
+        case v_param_name
+            when 'queue_max_retries' then
+                v_int_val := x_param_value::int8;
+                if v_int_val < 0 then
+                    raise exception 'set_queue_config: max_retries must be >= 0, got %', v_int_val;
+                end if;
+            when 'queue_ticker_max_count' then
+                v_int_val := x_param_value::int8;
+                if v_int_val <= 0 then
+                    raise exception 'set_queue_config: ticker_max_count must be > 0, got %', v_int_val;
+                end if;
+            when 'queue_ticker_max_lag' then
+                v_interval_val := x_param_value::interval;
+                if v_interval_val <= interval '0' then
+                    raise exception 'set_queue_config: ticker_max_lag must be > 0, got %', v_interval_val;
+                end if;
+            when 'queue_ticker_idle_period' then
+                v_interval_val := x_param_value::interval;
+                if v_interval_val <= interval '0' then
+                    raise exception 'set_queue_config: ticker_idle_period must be > 0, got %', v_interval_val;
+                end if;
+            when 'queue_rotation_period' then
+                v_interval_val := x_param_value::interval;
+                if v_interval_val <= interval '0' then
+                    raise exception 'set_queue_config: rotation_period must be > 0, got %', v_interval_val;
+                end if;
+            else
+                -- queue_ticker_paused / queue_external_ticker: bool, validated by cast.
+                null;
+        end case;
+    end if;
+
+    execute 'update pgque.queue set '
+        || v_param_name || ' = '
+        || case when x_param_value is null then 'DEFAULT' else quote_literal(x_param_value) end
+        || ' where queue_name = ' || quote_literal(x_queue_name);
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque-additions/lifecycle.sql
+-- pgque lifecycle functions
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+
+-- pgque.ticker_loop()
+--
+-- Sub-second tick driver: runs inside one pg_cron slot (1 second cadence) and
+-- internally invokes pgque.ticker() at the rate configured in
+-- pgque.config.tick_period_ms (default 100 ms = 10 ticks/sec).
+--
+-- Implemented as a PROCEDURE so it can `commit` between iterations: every
+-- pgque.ticker() call thereby gets its own transaction and the per-iteration
+-- xmin is released, preserving the rotation behaviour the metadata tables
+-- depend on.
+-- Note: a procedure that uses COMMIT cannot also carry a SET clause (Postgres
+-- restriction), so search_path is not pinned at the procedure level.  All
+-- references inside the body are fully schema-qualified, and the procedure
+-- only invokes SECURITY DEFINER functions (pgque.ticker / pgque.config) that
+-- pin their own search_path. ticker_loop itself is SECURITY INVOKER and
+-- callable only by pgque_admin / superuser (see grants below).
+--
+-- statement_timeout: NOT enforced from inside this procedure. Two reasons:
+-- (a) statement_timeout is a top-level-statement timer — the CALL is the
+--     statement, and its timer is fixed at invocation, so set_config inside
+--     the body changes the GUC value but does not restart or apply the
+--     timer to mid-procedure work; pg_sleep / ticker() run unguarded.
+-- (b) the obvious workaround of "SET statement_timeout = ...; CALL ..." in
+--     the pg_cron command is rejected at runtime: pg_cron concatenates the
+--     two statements into one multi-statement transaction, and the
+--     procedure's COMMIT then raises "invalid transaction termination".
+-- The loop's clock_timestamp()-based budget below limits how many additional
+-- iterations a slow run can chain together, but it cannot cancel a stuck
+-- ticker() call. A hung ticker() will pin the pg_cron worker until an admin
+-- pg_cancel_backend()s it. ticker() is short, well-trodden, and has no
+-- code paths that block indefinitely under normal operation; we accept the
+-- residual risk rather than ship a guardrail that doesn't actually fire.
+create or replace procedure pgque.ticker_loop()
+language plpgsql
+as $$
+declare
+    v_period_ms     integer;
+    v_window_ms     constant integer := 1000;
+    v_started_at    timestamptz := clock_timestamp();
+    v_elapsed_ms    double precision;
+    v_iter_budget   integer;
+    i               integer;
+begin
+    select tick_period_ms into v_period_ms from pgque.config;
+    if v_period_ms is null or v_period_ms < 1 then
+        v_period_ms := 100;
+    end if;
+    if v_period_ms > v_window_ms then
+        v_period_ms := v_window_ms;
+    end if;
+
+    v_iter_budget := greatest(1, v_window_ms / v_period_ms);
+
+    for i in 1 .. v_iter_budget loop
+        perform pgque.ticker();
+        commit;
+
+        if i = v_iter_budget then
+            exit;
+        end if;
+
+        v_elapsed_ms := extract(epoch from (clock_timestamp() - v_started_at)) * 1000.0;
+        if v_elapsed_ms + v_period_ms >= v_window_ms then
+            exit;
+        end if;
+
+        perform pg_sleep(v_period_ms / 1000.0);
+    end loop;
+end;
+$$;
+
+-- pgque.set_tick_period_ms(ms)
+--
+-- Configure how often pgque.ticker_loop() invokes pgque.ticker(). Default is
+-- 100 ms (10 ticks/sec). Lower values cut producer→consumer latency for non-LISTEN
+-- consumers; higher values reduce WAL volume and metadata churn.
+--
+-- Takes effect on the next pg_cron slot (≤1 s) without rescheduling.
+create or replace function pgque.set_tick_period_ms(p_period_ms integer)
+returns integer as $$
+begin
+    -- 1..1000 ms and an exact divisor of the 1000 ms pg_cron slot: ticker_loop
+    -- uses integer iteration counts, so arbitrary values (for example 251 or
+    -- 750) would report an ideal cadence that cannot actually run in one slot.
+    -- Reject them rather than silently flooring the effective rate.
+    if p_period_ms is null or p_period_ms < 1 or p_period_ms > 1000 then
+        raise exception 'tick_period_ms must be an exact divisor of 1000 between 1 and 1000 (got %)',
+            coalesce(p_period_ms::text, 'NULL');
+    end if;
+    if 1000 % p_period_ms <> 0 then
+        raise exception 'tick_period_ms must be an exact divisor of 1000 between 1 and 1000 (got %)',
+            p_period_ms;
+    end if;
+    update pgque.config set tick_period_ms = p_period_ms;
+    return p_period_ms;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.start()
+returns void as $$
+declare
+    v_ticker_id bigint;
+    v_retry_id bigint;
+    v_maint_id bigint;
+    v_step2_id bigint;
+    v_dbname text;
+    v_period_ms integer;
+begin
+    -- pg_cron is optional; start() specifically requires it because it schedules jobs.
+    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+        raise exception 'pg_cron extension is not installed. '
+            'PgQue itself works without pg_cron, but pgque.start() schedules cron jobs. '
+            'Install pg_cron first, or run pgque.ticker() and pgque.maint() manually.';
+    end if;
+
+    -- Idempotent: stop existing jobs first
+    perform pgque.stop_timetable();
+    perform pgque.stop();
+
+    v_dbname := current_database();
+    select tick_period_ms into v_period_ms from pgque.config;
+
+    -- Ticker: pg_cron fires every 1 second; pgque.ticker_loop() then
+    -- internally re-ticks at pgque.config.tick_period_ms cadence (default
+    -- 100 ms = 10 ticks/sec). Tune via pgque.set_tick_period_ms(ms).
+    --
+    -- Bare CALL: NO `SET statement_timeout = ...;` prefix. pg_cron
+    -- concatenates SET + CALL into one multi-statement transaction, and a
+    -- procedure that issues COMMIT inside that wrapper raises "invalid
+    -- transaction termination". See ticker_loop's source comment for the
+    -- full reasoning on why a per-iteration statement_timeout cannot be
+    -- enforced from inside the procedure either.
+    select cron.schedule_in_database(
+        'pgque_ticker',
+        '1 second',
+        $sql$CALL pgque.ticker_loop()$sql$,
+        v_dbname
+    ) into v_ticker_id;
+
+    -- Retry events: every 30 seconds (move nack'd events from the retry
+    -- queue back into the main event stream for the next tick).
+    -- pgque.maint() / maint_operations() does NOT include retry handling,
+    -- so this has to be scheduled separately — matches pgqd cadence.
+    select cron.schedule_in_database(
+        'pgque_retry_events',
+        '30 seconds',
+        $sql$set statement_timeout = '25s'; select pgque.maint_retry_events()$sql$,
+        v_dbname
+    ) into v_retry_id;
+
+    -- Maintenance: every 30 seconds (rotation step 1 and vacuum).
+    select cron.schedule_in_database(
+        'pgque_maint',
+        '30 seconds',
+        $sql$SET statement_timeout = '25s'; SELECT pgque.maint()$sql$,
+        v_dbname
+    ) into v_maint_id;
+
+    -- Rotation step2: every 10 seconds, SEPARATE transaction from step1.
+    -- PgQ requires step1 and step2 in different transactions so that
+    -- step2's txid is guaranteed to be visible to all new transactions.
+    select cron.schedule_in_database(
+        'pgque_rotate_step2',
+        '10 seconds',
+        $sql$SELECT pgque.maint_rotate_tables_step2()$sql$,
+        v_dbname
+    ) into v_step2_id;
+
+    -- Store job IDs in config (retry + rotate_step2 unscheduled by name)
+    update pgque.config
+    set ticker_job_id = v_ticker_id,
+        maint_job_id = v_maint_id,
+        scheduler = 'pg_cron';
+
+    raise notice 'pgque started: ticker=% (% ticks/sec), retry_events=%, maint=%, rotate_step2=%',
+        v_ticker_id, (1000.0 / v_period_ms)::numeric(10, 2),
+        v_retry_id, v_maint_id, v_step2_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.stop()
+returns void as $$
+declare
+    v_ticker_id bigint;
+    v_maint_id bigint;
+    v_has_pgcron bool;
+    v_scheduler text;
+begin
+    -- Read current job IDs
+    select ticker_job_id, maint_job_id, scheduler
+    into v_ticker_id, v_maint_id, v_scheduler
+    from pgque.config;
+
+    -- stop() is the generic PgQue stop entrypoint; delegate when pg_timetable
+    -- owns the active jobs.
+    if v_scheduler = 'pg_timetable' then
+        perform pgque.stop_timetable();
+        return;
+    end if;
+
+    -- Check if pg_cron is available
+    select exists (select 1 from pg_extension where extname = 'pg_cron')
+    into v_has_pgcron;
+
+    if v_has_pgcron and (v_scheduler is null or v_scheduler = 'pg_cron') then
+        -- Unschedule ticker if it exists
+        if v_ticker_id is not null then
+            perform cron.unschedule(v_ticker_id);
+        end if;
+
+        -- Unschedule maint if it exists
+        if v_maint_id is not null then
+            perform cron.unschedule(v_maint_id);
+        end if;
+
+        -- Unschedule retry_events by name (job ID not stored in config).
+        -- Ignore if job doesn't exist (first run or already removed).
+        begin
+            perform cron.unschedule('pgque_retry_events');
+        exception when others then
+            raise notice 'pgque.stop: retry_events job not found (OK on first install)';
+        end;
+
+        -- Unschedule rotate_step2 by name (job ID not stored in config)
+        -- Ignore if job doesn't exist (first run or already removed)
+        begin
+            perform cron.unschedule('pgque_rotate_step2');
+        exception when others then
+            raise notice 'pgque.stop: rotate_step2 job not found (OK on first install)';
+        end;
+    end if;
+
+    -- Clear pg_cron job IDs (only when scheduler is pg_cron or unset).
+    update pgque.config
+    set ticker_job_id = null,
+        maint_job_id = null,
+        scheduler = null
+    where scheduler is null or scheduler = 'pg_cron';
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+
+create or replace function pgque.start_timetable(i_ticks_per_second integer default 10)
+returns void as $$
+declare
+    v_ticker_id bigint;
+    v_retry_id bigint;
+    v_maint_id bigint;
+    v_step2_id bigint;
+    v_period_ms integer;
+    v_timetable_owner oid;
+    v_add_job_reg regprocedure;
+    v_delete_job_reg regprocedure;
+    v_owner_super bool;
+begin
+    -- pg_timetable is optional and external (standalone scheduler). It creates
+    -- the timetable schema on first run; PgQue only needs its SQL API here.
+    if to_regnamespace('timetable') is null then
+        raise exception 'pg_timetable schema/API is not installed. '
+            'Run pg_timetable against this database first, or use pgque.start() for pg_cron.';
+    end if;
+
+    -- Support both modern pg_timetable (12-argument add_job with job_on_error)
+    -- and older v4-style installs (11-argument add_job). The named-argument
+    -- calls below only use parameters common to both versions.
+    v_add_job_reg := coalesce(
+        to_regprocedure('timetable.add_job(text,timetable.cron,text,jsonb,timetable.command_kind,text,integer,boolean,boolean,boolean,boolean,text)'),
+        to_regprocedure('timetable.add_job(text,timetable.cron,text,jsonb,timetable.command_kind,text,integer,boolean,boolean,boolean,boolean)')
+    );
+    v_delete_job_reg := to_regprocedure('timetable.delete_job(text)');
+    if v_add_job_reg is null or v_delete_job_reg is null then
+        raise exception 'pg_timetable schema/API is not installed. '
+            'Run pg_timetable against this database first, or use pgque.start() for pg_cron.';
+    end if;
+
+    -- start_timetable() is SECURITY DEFINER, so do not invoke arbitrary code
+    -- from any schema named "timetable". Trust only a pg_timetable schema owned
+    -- by the PgQue owner or by a superuser, and require the called functions to
+    -- share that owner. This prevents a low-privilege fake timetable schema from
+    -- becoming a definer-privilege trampoline.
+    select nspowner into v_timetable_owner
+    from pg_namespace where oid = 'timetable'::regnamespace;
+    select rolsuper into v_owner_super
+    from pg_roles where oid = v_timetable_owner;
+    if v_timetable_owner <> current_user::regrole and not coalesce(v_owner_super, false) then
+        raise exception 'untrusted pg_timetable schema owner: %', v_timetable_owner::regrole;
+    end if;
+    if exists (
+        select 1
+        from pg_proc
+        where oid in (v_add_job_reg::oid, v_delete_job_reg::oid)
+          and proowner <> v_timetable_owner
+    ) then
+        raise exception 'untrusted pg_timetable API owner: add_job/delete_job must be owned by timetable schema owner';
+    end if;
+
+    if i_ticks_per_second is null or i_ticks_per_second < 1 or i_ticks_per_second > 1000
+       or 1000 % i_ticks_per_second <> 0 then
+        raise exception 'ticks_per_second must be an exact divisor of 1000 between 1 and 1000 (got %)',
+            coalesce(i_ticks_per_second::text, 'NULL');
+    end if;
+
+    v_period_ms := 1000 / i_ticks_per_second;
+    perform pgque.set_tick_period_ms(v_period_ms);
+
+    -- Idempotent: remove any old PgQue jobs from both schedulers.  This avoids
+    -- double-ticking if an operator switches from pg_cron to pg_timetable.
+    perform pgque.stop_timetable();
+    perform pgque.stop();
+
+    execute $sql$
+        select timetable.add_job(
+            job_name => 'pgque_ticker',
+            job_schedule => '@every 1 second'::timetable.cron,
+            job_command => 'CALL pgque.ticker_loop()',
+            job_kind => 'SQL'::timetable.command_kind,
+            job_max_instances => 1,
+            job_ignore_errors => false
+        )
+    $sql$ into v_ticker_id;
+
+    execute $sql$
+        select timetable.add_job(
+            job_name => 'pgque_retry_events',
+            job_schedule => '@every 30 seconds'::timetable.cron,
+            job_command => 'select pgque.maint_retry_events()',
+            job_kind => 'SQL'::timetable.command_kind,
+            job_max_instances => 1,
+            job_ignore_errors => false
+        )
+    $sql$ into v_retry_id;
+
+    execute $sql$
+        select timetable.add_job(
+            job_name => 'pgque_maint',
+            job_schedule => '@every 30 seconds'::timetable.cron,
+            job_command => 'select pgque.maint()',
+            job_kind => 'SQL'::timetable.command_kind,
+            job_max_instances => 1,
+            job_ignore_errors => false
+        )
+    $sql$ into v_maint_id;
+
+    execute $sql$
+        select timetable.add_job(
+            job_name => 'pgque_rotate_step2',
+            job_schedule => '@every 10 seconds'::timetable.cron,
+            job_command => 'select pgque.maint_rotate_tables_step2()',
+            job_kind => 'SQL'::timetable.command_kind,
+            job_max_instances => 1,
+            job_ignore_errors => false
+        )
+    $sql$ into v_step2_id;
+
+    update pgque.config
+    set ticker_job_id = v_ticker_id,
+        maint_job_id = v_maint_id,
+        scheduler = 'pg_timetable';
+
+    raise notice 'pgque started with pg_timetable: ticker=% (% ticks/sec), retry_events=%, maint=%, rotate_step2=%',
+        v_ticker_id, i_ticks_per_second, v_retry_id, v_maint_id, v_step2_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.stop_timetable()
+returns void as $$
+declare
+    v_has_timetable bool;
+    v_timetable_owner oid;
+    v_delete_job_reg regprocedure;
+    v_owner_super bool;
+    v_scheduler text;
+begin
+    select scheduler into v_scheduler from pgque.config;
+
+    v_has_timetable := to_regnamespace('timetable') is not null
+        and to_regprocedure('timetable.delete_job(text)') is not null;
+
+    if v_has_timetable then
+        v_delete_job_reg := to_regprocedure('timetable.delete_job(text)');
+        select nspowner into v_timetable_owner
+        from pg_namespace where oid = 'timetable'::regnamespace;
+        select rolsuper into v_owner_super
+        from pg_roles where oid = v_timetable_owner;
+        if v_timetable_owner <> current_user::regrole and not coalesce(v_owner_super, false) then
+            if v_scheduler = 'pg_timetable' then
+                raise exception 'untrusted pg_timetable schema owner: %', v_timetable_owner::regrole;
+            end if;
+            return;
+        end if;
+        if exists (
+            select 1
+            from pg_proc
+            where oid = v_delete_job_reg::oid
+              and proowner <> v_timetable_owner
+        ) then
+            if v_scheduler = 'pg_timetable' then
+                raise exception 'untrusted pg_timetable API owner: delete_job must be owned by timetable schema owner';
+            end if;
+            return;
+        end if;
+
+        -- delete_job(name) returns false when absent; no exception noise needed.
+        execute $sql$select timetable.delete_job('pgque_ticker')$sql$;
+        execute $sql$select timetable.delete_job('pgque_retry_events')$sql$;
+        execute $sql$select timetable.delete_job('pgque_maint')$sql$;
+        execute $sql$select timetable.delete_job('pgque_rotate_step2')$sql$;
+    end if;
+
+    update pgque.config
+    set ticker_job_id = null,
+        maint_job_id = null,
+        scheduler = null
+    where scheduler = 'pg_timetable';
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.uninstall()
+returns void as $$
+begin
+    -- Stop pg_cron jobs before dropping the schema.
+    if exists (select 1 from pg_extension where extname = 'pg_cron') then
+        perform pgque.stop();
+    end if;
+    if to_regnamespace('timetable') is not null then
+        perform pgque.stop_timetable();
+    end if;
+    -- Drop everything
+    drop schema pgque cascade;
+    -- Note: roles are not dropped here (they may be in use by other databases)
+    raise notice 'pgque uninstalled. Run DROP ROLE IF EXISTS pgque_reader, pgque_writer, pgque_admin; manually if needed.';
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.version()
+returns text as $$
+begin
+    return '0.2.0';
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.status()
+returns table (
+    component text,
+    status text,
+    detail text
+) as $$
+begin
+    -- PostgreSQL version
+    return query select 'postgresql'::text, 'info'::text, pg_catalog.version()::text;
+
+    -- pgque version
+    return query select 'pgque'::text, 'info'::text, pgque.version();
+
+    -- Scheduler status (new summary row).
+    return query
+    select 'scheduler'::text,
+        coalesce(c.scheduler, 'manual')::text,
+        format('ticker_job_id=%s, maint_job_id=%s, tick_period_ms=%s (%s ticks/sec)',
+            coalesce(c.ticker_job_id::text, 'NULL'),
+            coalesce(c.maint_job_id::text, 'NULL'),
+            c.tick_period_ms,
+            (1000.0 / c.tick_period_ms)::numeric(10, 2))
+    from pgque.config c;
+
+    -- Backward-compatible rows retained for scripts that parse status() by
+    -- component name.
+    return query
+    select 'ticker'::text,
+        case when c.ticker_job_id is not null then 'scheduled' else 'stopped' end,
+        case when c.ticker_job_id is not null
+            then format('scheduler=%s, job_id=%s, tick_period_ms=%s (%s ticks/sec)',
+                coalesce(c.scheduler, 'manual'),
+                c.ticker_job_id,
+                c.tick_period_ms,
+                (1000.0 / c.tick_period_ms)::numeric(10, 2))
+            else format('not scheduled (tick_period_ms=%s)', c.tick_period_ms)
+        end
+    from pgque.config c;
+
+    return query
+    select 'maintenance'::text,
+        case when c.maint_job_id is not null then 'scheduled' else 'stopped' end,
+        case when c.maint_job_id is not null
+            then format('scheduler=%s, job_id=%s', coalesce(c.scheduler, 'manual'), c.maint_job_id)
+            else 'not scheduled'
+        end
+    from pgque.config c;
+
+    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+        return query select 'pg_cron'::text, 'unavailable'::text,
+            'use pgque.start_timetable() for pg_timetable, or call pgque.ticker() / pgque.maint() manually'::text;
+    end if;
+
+    if to_regnamespace('timetable') is null then
+        return query select 'pg_timetable'::text, 'unavailable'::text,
+            'run pg_timetable against this database, then call pgque.start_timetable()'::text;
+    end if;
+
+    -- Queue count
+    return query select 'queues'::text, 'info'::text,
+        (select count(*)::text from pgque.queue) || ' queues configured';
+
+    -- Consumer count
+    return query select 'consumers'::text, 'info'::text,
+        (select count(*)::text from pgque.subscription) || ' active subscriptions';
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque-additions/tick_helpers.sql
+-- pgque tick helpers
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- pgque.force_next_tick(queue) is the clearer name for the inherited
+-- PgQ helper pgque.force_tick(queue). They share one body (this function
+-- delegates to pgque.force_tick) so behavior is identical and there is no
+-- drift risk.
+--
+-- Why "force_next_tick"? The name says this affects the next ticker pass:
+-- the function bumps the queue's event sequence past the ticker_max_count
+-- threshold so the next pgque.ticker() call sees plenty of "new" events
+-- and skips the throttle. It does NOT insert a tick by itself. The
+-- canonical idiom is the pair:
+--
+--     select pgque.force_next_tick('q'); -- force next ticker pass
+--     select pgque.ticker();             -- materialise the tick
+--
+-- The historical name pgque.force_tick is misleading: it suggests the
+-- function inserts a tick row directly, which it does not. force_tick
+-- stays as a permanent alias for backward compatibility (it is the
+-- upstream PgQ name, in use since the Skype/Marko Kreen era ~2007).
+
+create or replace function pgque.force_next_tick(i_queue_name text)
+returns bigint as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.force_next_tick(1)
+--
+--      Force the NEXT pgque.ticker() call to insert a tick by bumping the
+--      queue's event sequence past ticker_max_count / ticker_max_lag
+--      thresholds.
+--
+--      Bumps queue_event_seq by ticker_max_count * 2 + 1000 to simulate
+--      a burst of events. Does NOT insert a tick itself — callers must
+--      invoke pgque.ticker() (or pgque.ticker(queue)) afterwards.
+--
+-- Parameters:
+--      i_queue_name     - Name of the queue
+--
+-- Returns:
+--      Currently last tick id (the most recent EXISTING tick on the
+--      queue, not a newly created one).
+-- ----------------------------------------------------------------------
+begin
+    return pgque.force_tick(i_queue_name);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- force_next_tick is admin-only (matches force_tick). The schema-wide
+-- "grant execute on all functions … to pgque_admin" earlier in the
+-- install handles the grant; the schema-wide revoke from PUBLIC at
+-- the bottom of the install handles the lockdown. Nothing extra to
+-- emit here.
+
+-- pgque-additions/roles.sql
+-- pgque security roles
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+
+-- Create roles idempotently.
+do $$
+begin
+    if not exists (select from pg_roles where rolname = 'pgque_reader') then
+        create role pgque_reader;
+    end if;
+    if not exists (select from pg_roles where rolname = 'pgque_writer') then
+        create role pgque_writer;
+    end if;
+    if not exists (select from pg_roles where rolname = 'pgque_admin') then
+        create role pgque_admin;
+    end if;
+end $$;
+
+-- Role hierarchy: pgque_admin inherits both pgque_reader and pgque_writer.
+-- pgque_reader and pgque_writer are SIBLINGS, not parent/child — this matches
+-- upstream PgQ's `create role pgq_admin in role pgq_reader, pgq_writer;`
+-- model.
+--
+-- Why siblings, not writer-inherits-reader: a producer-only role MUST NOT be
+-- able to call consumer-side primitives like finish_batch / ack / next_batch.
+-- Otherwise any role that can pgque.send() can also ack any consumer's batch
+-- by id (issue #102) and read/mutate other consumers' active batches
+-- (issue #106). Apps that both produce and consume must be granted BOTH
+-- pgque_reader and pgque_writer explicitly.
+--
+-- Upgrade path (CRITICAL): pre-#163 installs granted pgque_reader to
+-- pgque_writer. Postgres does NOT revoke prior role grants on re-install,
+-- so we must do it explicitly. Without this, in-place upgrades silently
+-- retain the vulnerable inheritance and the security fix is a no-op.
+do $$
+begin
+    if pg_has_role('pgque_writer', 'pgque_reader', 'member') then
+        revoke pgque_reader from pgque_writer;
+    end if;
+end $$;
+
+-- Grant role hierarchy idempotently. Use explicit membership checks instead
+-- of GRANT IF NOT EXISTS so this stays compatible with PG14/15.
+do $$
+begin
+    if not pg_has_role('pgque_admin', 'pgque_reader', 'member') then
+        grant pgque_reader to pgque_admin;
+    end if;
+    if not pg_has_role('pgque_admin', 'pgque_writer', 'member') then
+        grant pgque_writer to pgque_admin;
+    end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- Reader: consume events. Includes batch processing primitives — registering
+-- consumers, opening/closing batches, retrying events. Mirrors PgQ's
+-- pgq_reader role.
+-- ---------------------------------------------------------------------------
+grant usage on schema pgque to pgque_reader;
+grant select on all tables in schema pgque to pgque_reader;
+
+-- get_queue_info — 0-arg (all queues) and 1-arg (single queue)
+grant execute on function pgque.get_queue_info() to pgque_reader;
+grant execute on function pgque.get_queue_info(text) to pgque_reader;
+
+-- get_consumer_info — 0-arg, 1-arg, 2-arg overloads
+grant execute on function pgque.get_consumer_info() to pgque_reader;
+grant execute on function pgque.get_consumer_info(text) to pgque_reader;
+grant execute on function pgque.get_consumer_info(text, text) to pgque_reader;
+
+-- get_batch_info(bigint)
+grant execute on function pgque.get_batch_info(bigint) to pgque_reader;
+
+-- version
+grant execute on function pgque.version() to pgque_reader;
+
+-- Upgrade path (CRITICAL): the consumer-side primitives below moved from
+-- pgque_writer to pgque_reader in #163. Postgres preserves function-level
+-- grants across `create or replace function`, so a re-install on a pre-#163
+-- database silently keeps the old pgque_writer grants. Explicitly revoke
+-- before re-granting. Each revoke is idempotent (no-op if the grant doesn't
+-- exist).
+revoke execute on function pgque.register_consumer(text, text) from pgque_writer;
+revoke execute on function pgque.register_consumer_at(text, text, bigint) from pgque_writer;
+revoke execute on function pgque.unregister_consumer(text, text) from pgque_writer;
+revoke execute on function pgque.next_batch(text, text) from pgque_writer;
+revoke execute on function pgque.next_batch_info(text, text) from pgque_writer;
+revoke execute on function pgque.next_batch_custom(text, text, interval, int4, interval) from pgque_writer;
+revoke execute on function pgque.get_batch_events(bigint) from pgque_writer;
+revoke execute on function pgque.finish_batch(bigint) from pgque_writer;
+revoke execute on function pgque.event_retry(bigint, bigint, timestamptz) from pgque_writer;
+revoke execute on function pgque.event_retry(bigint, bigint, integer) from pgque_writer;
+
+-- consumer registration (consumer side: create/move/drop a subscription cursor)
+grant execute on function pgque.register_consumer(text, text) to pgque_reader;
+grant execute on function pgque.register_consumer_at(text, text, bigint) to pgque_reader;
+grant execute on function pgque.unregister_consumer(text, text) to pgque_reader;
+
+-- batch processing
+grant execute on function pgque.next_batch(text, text) to pgque_reader;
+grant execute on function pgque.next_batch_info(text, text) to pgque_reader;
+grant execute on function pgque.next_batch_custom(text, text, interval, int4, interval) to pgque_reader;
+grant execute on function pgque.get_batch_events(bigint) to pgque_reader;
+grant execute on function pgque.finish_batch(bigint) to pgque_reader;
+
+-- event retry — timestamptz and integer overloads
+grant execute on function pgque.event_retry(bigint, bigint, timestamptz) to pgque_reader;
+grant execute on function pgque.event_retry(bigint, bigint, integer) to pgque_reader;
+
+-- ---------------------------------------------------------------------------
+-- Writer: produce events. Strictly producer-side primitives.
+-- ---------------------------------------------------------------------------
+
+-- insert_event — 3-arg and 7-arg overloads
+grant execute on function pgque.insert_event(text, text, text) to pgque_writer;
+grant execute on function pgque.insert_event(text, text, text, text, text, text, text) to pgque_writer;
+
+-- Note: grants for the modern API wrappers (send*, subscribe, unsubscribe,
+-- receive, ack, nack) live colocated with their definitions in
+-- sql/pgque-api/*.sql. transform.sh appends pgque-additions/ before
+-- pgque-api/, so API-layer grants cannot reference their functions from
+-- this file. send* go to pgque_writer; subscribe/unsubscribe/receive/ack/nack
+-- go to pgque_reader.
+
+-- Deny-by-default: revoke PUBLIC EXECUTE so role grants below are authoritative.
+revoke execute on all functions in schema pgque from public;
+
+-- ---------------------------------------------------------------------------
+-- Admin: full access to everything in the pgque schema
+-- ---------------------------------------------------------------------------
+grant all on schema pgque to pgque_admin;
+grant all on all tables in schema pgque to pgque_admin;
+grant all on all sequences in schema pgque to pgque_admin;
+grant execute on all functions in schema pgque to pgque_admin;
+
+-- uninstall() drops the entire schema — only superuser / schema owner should run it.
+-- Revoke from pgque_admin (the "all functions" grant above would otherwise include it).
+revoke execute on function pgque.uninstall() from pgque_admin;
+
+-- insert_event_bulk() is an internal primitive for SECURITY DEFINER send_batch()
+-- wrappers. It is defined later during a full install, so revoke here only
+-- when roles.sql is run after pgque-api/send.sql has already been loaded.
+do $$
+begin
+    if to_regprocedure('pgque.insert_event_bulk(text, text, text[])') is not null then
+        revoke execute on function pgque.insert_event_bulk(text, text, text[])
+            from public, pgque_reader, pgque_writer, pgque_admin;
+    end if;
+end $$;
+
+
+-- get_batch_cursor is an advanced PgQ-compatible primitive.
+-- Keep both overloads admin-only; application roles should use pgque.receive().
+revoke execute on function pgque.get_batch_cursor(bigint, text, int4)        from public, pgque_reader, pgque_writer;
+revoke execute on function pgque.get_batch_cursor(bigint, text, int4, text)  from public, pgque_reader, pgque_writer;
+
+-- Procedure grants. "execute on all functions" / public-revoke above does NOT
+-- cover procedures, so admin-only grants are spelled out explicitly.
+revoke execute on procedure pgque.ticker_loop() from public;
+grant execute on procedure pgque.ticker_loop() to pgque_admin;
+
+-- pgque-additions/dlq.sql
+-- pgque dead letter queue (DLQ) -- table + helper functions
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- PgQ has a retry queue but no dead letter queue. pgque adds one.
+-- See SPECx.md section 4.5.
+
+-- pgque.dead_letter table
+--
+-- FK behavior: both dl_queue_id and dl_consumer_id use `on delete cascade`.
+-- Rationale:
+--   - `pgque.drop_queue()` deletes the pgque.queue row unconditionally. DLQ
+--     entries for a dropped queue are meaningless, so cascading them is
+--     correct (users who want to preserve the audit trail should call
+--     `pgque.dlq_purge` or copy the rows out before dropping the queue).
+--   - `pgque.unregister_consumer()` deletes the pgque.consumer row only when
+--     the consumer has no other subscriptions. That is an explicit,
+--     user-initiated action (not routine maintenance), so cascading the
+--     historical DLQ rows tied to that (now-removed) consumer id is the
+--     least-surprising default. Same escape hatch: purge/copy first if the
+--     audit trail matters.
+create table if not exists pgque.dead_letter (
+    dl_id           bigserial primary key,
+    dl_queue_id     int4 not null references pgque.queue(queue_id)    on delete cascade,
+    dl_consumer_id  int4 not null references pgque.consumer(co_id)    on delete cascade,
+    dl_time         timestamptz not null default now(),
+    dl_reason       text,
+
+    -- Original event fields (copied from event at time of death)
+    ev_id           bigint not null,
+    ev_time         timestamptz not null,
+    ev_txid         xid8,
+    ev_retry        int4,
+    ev_type         text,
+    ev_data         text,
+    ev_extra1       text,
+    ev_extra2       text,
+    ev_extra3       text,
+    ev_extra4       text
+);
+
+create index if not exists dl_queue_time_idx
+    on pgque.dead_letter (dl_queue_id, dl_time);
+
+-- Unique index: one DLQ row per (queue, consumer, original ev_id).
+-- Required for idempotent insert in event_dead() (#104).
+create unique index if not exists dl_queue_consumer_ev_idx
+    on pgque.dead_letter (dl_queue_id, dl_consumer_id, ev_id);
+
+-- pgque.event_dead() -- move event to DLQ (called by nack() when max retries exceeded)
+-- The insert uses ON CONFLICT DO NOTHING so that repeated nack() calls for
+-- the same terminal message are idempotent (fix for #104).
+create or replace function pgque.event_dead(
+    i_batch_id bigint,
+    i_event_id bigint,
+    i_reason text,
+    i_ev_time timestamptz,
+    i_ev_txid xid8,
+    i_ev_retry int4,
+    i_ev_type text,
+    i_ev_data text,
+    i_ev_extra1 text default null,
+    i_ev_extra2 text default null,
+    i_ev_extra3 text default null,
+    i_ev_extra4 text default null)
+returns integer as $$
+declare
+    v_sub record;
+begin
+    -- Look up subscription from batch. For cooperative subconsumers, route
+    -- the DLQ row to the coop_main's co_id rather than the member's. Member
+    -- consumer rows are ephemeral (workers come and go); the main is the
+    -- persistent consumer-group identity. Anchoring DLQ rows to the member
+    -- would let unregister_subconsumer (which deletes the orphan member
+    -- consumer row) cascade-delete a freshly inserted DLQ row before commit.
+    select
+        s.sub_queue,
+        coalesce(m.sub_consumer, s.sub_consumer) as sub_consumer
+    into v_sub
+    from pgque.subscription s
+    left join pgque.subscription m
+        on s.sub_role = 'coop_member'
+        and m.sub_id = s.sub_id
+        and m.sub_queue = s.sub_queue
+        and m.sub_role = 'coop_main'
+    where s.sub_batch = i_batch_id;
+    if not found then
+        raise exception 'batch not found: %', i_batch_id;
+    end if;
+
+    -- Idempotent insert: if the same (queue, consumer, ev_id) tuple already
+    -- exists (repeated nack() before ack()), silently skip the duplicate.
+    insert into pgque.dead_letter (
+        dl_queue_id, dl_consumer_id, dl_reason,
+        ev_id, ev_time, ev_txid, ev_retry, ev_type, ev_data,
+        ev_extra1, ev_extra2, ev_extra3, ev_extra4)
+    values (
+        v_sub.sub_queue, v_sub.sub_consumer, i_reason,
+        i_event_id, i_ev_time, i_ev_txid, i_ev_retry, i_ev_type, i_ev_data,
+        i_ev_extra1, i_ev_extra2, i_ev_extra3, i_ev_extra4)
+    on conflict (dl_queue_id, dl_consumer_id, ev_id) do nothing;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.dlq_inspect() -- inspect DLQ entries for a queue
+create or replace function pgque.dlq_inspect(
+    i_queue_name text, i_limit_count int default 100)
+returns setof pgque.dead_letter as $$
+begin
+    return query
+    select dl.*
+    from pgque.dead_letter dl
+    join pgque.queue q on q.queue_id = dl.dl_queue_id
+    where q.queue_name = i_queue_name
+    order by dl.dl_time desc
+    limit i_limit_count;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.dlq_replay() -- replay a single dead letter event back into the queue
+create or replace function pgque.dlq_replay(i_dead_letter_id bigint)
+returns bigint as $$
+declare
+    v_dl record;
+    v_queue_name text;
+    v_new_eid bigint;
+begin
+    select dl.*, q.queue_name into v_dl
+    from pgque.dead_letter dl
+    join pgque.queue q on q.queue_id = dl.dl_queue_id
+    where dl.dl_id = i_dead_letter_id;
+
+    if not found then
+        raise exception 'dead letter entry not found: %', i_dead_letter_id;
+    end if;
+
+    -- Re-insert into the queue
+    v_new_eid := pgque.insert_event(v_dl.queue_name, v_dl.ev_type, v_dl.ev_data,
+        v_dl.ev_extra1, v_dl.ev_extra2, v_dl.ev_extra3, v_dl.ev_extra4);
+
+    -- Remove from DLQ
+    delete from pgque.dead_letter where dl_id = i_dead_letter_id;
+
+    return v_new_eid;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.dlq_replay_all() -- replay all DLQ events for a queue.
+--
+-- Returns a single row (replayed, failed, first_error). Per-event failures are
+-- caught so one bad event does not abort the rest, and surfaced via raise
+-- warning (visible at the default log_min_messages = warning, unlike notice
+-- which is hidden under many production configs). Callers can check
+-- failed > 0 to detect partial success programmatically.
+--
+-- Return-type change from v0.1's bare integer count to a record is a breaking
+-- API change accepted at the v0.2 cut. Callers previously doing
+--   select pgque.dlq_replay_all('q')          -- returned int
+-- should switch to
+--   select replayed from pgque.dlq_replay_all('q')
+-- or destructure all three columns.
+--
+-- Drop first so upgrades from v0.1 do not hit "cannot change return type".
+drop function if exists pgque.dlq_replay_all(text);
+create or replace function pgque.dlq_replay_all(i_queue_name text,
+    out replayed bigint, out failed bigint, out first_error text)
+returns record as $$
+declare
+    v_dl record;
+begin
+    replayed := 0;
+    failed := 0;
+    first_error := null;
+
+    for v_dl in
+        select dl.dl_id, dl.ev_type, dl.ev_data,
+               dl.ev_extra1, dl.ev_extra2, dl.ev_extra3, dl.ev_extra4,
+               q.queue_name
+        from pgque.dead_letter dl
+        join pgque.queue q on q.queue_id = dl.dl_queue_id
+        where q.queue_name = i_queue_name
+    loop
+        begin
+            perform pgque.insert_event(v_dl.queue_name, v_dl.ev_type, v_dl.ev_data,
+                v_dl.ev_extra1, v_dl.ev_extra2, v_dl.ev_extra3, v_dl.ev_extra4);
+            delete from pgque.dead_letter where dl_id = v_dl.dl_id;
+            replayed := replayed + 1;
+        exception when others then
+            failed := failed + 1;
+            if first_error is null then
+                first_error := format('dl_id=%s: %s', v_dl.dl_id, sqlerrm);
+            end if;
+            raise warning 'dlq_replay_all: failed to replay dl_id=%, error: %',
+                v_dl.dl_id, sqlerrm;
+        end;
+    end loop;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.dlq_purge() -- purge old DLQ entries
+create or replace function pgque.dlq_purge(
+    i_queue_name text, i_older_than interval default '30 days')
+returns integer as $$
+declare
+    v_cnt integer;
+begin
+    delete from pgque.dead_letter
+    where dl_queue_id = (select queue_id from pgque.queue where queue_name = i_queue_name)
+      and dl_time < now() - i_older_than;
+    get diagnostics v_cnt = row_count;
+    return v_cnt;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- ---------------------------------------------------------------------------
+-- Grants
+-- ---------------------------------------------------------------------------
+-- dlq.sql runs after roles.sql in transform.sh, so role names already exist.
+-- However, roles.sql's blanket "grant select on all tables / execute on all
+-- functions" passes ran *before* dlq.sql created these objects, so they do
+-- NOT cover the DLQ table and functions. The explicit grants below are
+-- therefore required (not redundant) for every role mentioned, including
+-- pgque_admin.
+--
+-- dlq_inspect is read-only — available to pgque_reader and above.
+-- dlq_replay / dlq_replay_all re-insert events into queues — writer-level
+-- because they call insert_event(), the canonical produce primitive.
+-- (Replaying a dead-letter is conceptually a produce action: the event ends
+-- up back on the queue tail. A pure consumer with only pgque_reader cannot
+-- replay; that is intentional.)
+-- dlq_purge / event_dead: admin-level operations (purge = data loss,
+-- event_dead = internal DLQ hook called from nack()). Granted to pgque_admin
+-- explicitly for the reason above.
+--
+grant select on pgque.dead_letter                           to pgque_reader;
+grant all    on pgque.dead_letter                           to pgque_admin;
+grant all    on sequence pgque.dead_letter_dl_id_seq        to pgque_admin;
+
+-- Grant to intended roles.
+grant execute on function pgque.dlq_inspect(text, int)      to pgque_reader;
+grant execute on function pgque.dlq_replay(bigint)          to pgque_writer;
+grant execute on function pgque.dlq_replay_all(text)        to pgque_writer;
+grant execute on function pgque.event_dead(
+    bigint, bigint, text, timestamptz, xid8, int4,
+    text, text, text, text, text, text)                     to pgque_admin;
+grant execute on function pgque.dlq_purge(text, interval)   to pgque_admin;
+
+-- pgque-additions/hardening.sql
+-- pgque hardening overrides for #100.
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- Two findings from the round-2 raw-SQL audit:
+--
+--   Finding 2: pgque.ticker(queue, tick_id, ts, event_seq) — the external
+--   ticker push API — accepted any tick_id / event_seq the (queue, tick_id)
+--   PK didn't reject. Non-monotonic input could create ticks that consumers
+--   would never reach. The override validates that tick_id is strictly
+--   greater than the queue's current max tick_id and event_seq is at least
+--   the previous tick's event_seq.
+--
+--   Finding 3: pgque.force_tick(queue) returned NULL when the queue was
+--   missing, paused, or marked external_ticker. Silent NULL is a footgun
+--   in scripts and tests. The override raises clear errors instead.
+
+-- Override the 4-arg external ticker with monotonicity checks.
+create or replace function pgque.ticker(
+    i_queue_name text,
+    i_tick_id bigint,
+    i_orig_timestamp timestamptz,
+    i_event_seq bigint)
+returns bigint as $$
+declare
+    v_queue_id    int4;
+    v_paused      bool;
+    v_external    bool;
+    v_max_tick    bigint;
+    v_max_seq     bigint;
+begin
+    -- Resolve queue and capture validation flags up front.
+    select queue_id, queue_ticker_paused, queue_external_ticker
+      into v_queue_id, v_paused, v_external
+      from pgque.queue
+     where queue_name = i_queue_name;
+    if not found then
+        raise exception 'queue not found: %', i_queue_name;
+    end if;
+    if v_paused then
+        raise exception 'queue % is paused (queue_ticker_paused = true)',
+            i_queue_name;
+    end if;
+    if not v_external then
+        raise exception 'queue % is not configured for external ticker '
+            '(queue_external_ticker = false); use pgque.ticker(queue) instead',
+            i_queue_name;
+    end if;
+
+    -- Monotonicity: tick_id must be strictly greater than current max.
+    select coalesce(max(tick_id), 0)
+      into v_max_tick
+      from pgque.tick
+     where tick_queue = v_queue_id;
+    if i_tick_id <= v_max_tick then
+        raise exception 'external ticker tick_id must be strictly greater than current max (% <= %)',
+            i_tick_id, v_max_tick;
+    end if;
+
+    -- Monotonicity: event_seq must be >= previous tick's event_seq.
+    -- Equal is allowed (no new events between ticks); strictly less is a bug.
+    select tick_event_seq
+      into v_max_seq
+      from pgque.tick
+     where tick_queue = v_queue_id
+     order by tick_id desc
+     limit 1;
+    if v_max_seq is not null and i_event_seq < v_max_seq then
+        raise exception 'external ticker event_seq must be >= previous tick (% < %)',
+            i_event_seq, v_max_seq;
+    end if;
+
+    -- All checks passed: insert the tick and update sequence state.
+    insert into pgque.tick (tick_queue, tick_id, tick_time, tick_event_seq)
+    values (v_queue_id, i_tick_id, i_orig_timestamp, i_event_seq);
+
+    perform pgque.seq_setval(queue_tick_seq, i_tick_id),
+            pgque.seq_setval(queue_event_seq, i_event_seq)
+       from pgque.queue
+      where queue_id = v_queue_id;
+
+    perform pg_notify('pgque_' || i_queue_name, i_tick_id::text); -- PgQue transformation: LISTEN/NOTIFY wakeup (not in original PgQ)
+    return i_tick_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- Override force_tick: raise instead of silently returning NULL when the
+-- target queue is missing, paused, or configured for external ticker.
+create or replace function pgque.force_tick(i_queue_name text)
+returns bigint as $$
+declare
+    v_queue_id    int4;
+    v_paused      bool;
+    v_external    bool;
+    v_max_count   int4;
+    v_max_tick    bigint;
+begin
+    select queue_id, queue_ticker_paused, queue_external_ticker, queue_ticker_max_count
+      into v_queue_id, v_paused, v_external, v_max_count
+      from pgque.queue
+     where queue_name = i_queue_name;
+    if not found then
+        raise exception 'queue not found: %', i_queue_name;
+    end if;
+    if v_paused then
+        raise exception 'queue % is paused (queue_ticker_paused = true)',
+            i_queue_name;
+    end if;
+    if v_external then
+        raise exception 'queue % is configured for external ticker; '
+            'force_tick is meaningless — push ticks via pgque.ticker(queue, tick_id, ts, event_seq)',
+            i_queue_name;
+    end if;
+
+    -- Bump event-seq past ticker_max_count so the next pgque.ticker() run ticks.
+    perform setval(queue_event_seq, nextval(queue_event_seq) + v_max_count * 2 + 1000)
+       from pgque.queue
+      where queue_id = v_queue_id;
+
+    -- Return the current last tick id (the one before force_tick took effect).
+    -- If the queue has no ticks yet, returns NULL — same as the upstream
+    -- behavior on a brand-new queue.
+    select tick_id
+      into v_max_tick
+      from pgque.tick
+     where tick_queue = v_queue_id
+     order by tick_id desc
+     limit 1;
+    return v_max_tick;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- ======================================================================
+-- Section 7: pgque-api (NEW — not derived from PgQ)
+-- ======================================================================
+
+-- pgque-api/maint.sql
+-- pgque maint() -- default maintenance runner for v0.1
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- Runs PgQ maintenance operations (rotation, retry, extra hooks).
+-- Experimental addons may override this function to extend maintenance.
+
+-- maint() runs rotation step1 and retry. Step2 needs its own transaction
+-- (PgQ design requirement) and is scheduled separately by pgque.start().
+create or replace function pgque.maint()
+returns integer as $$
+declare
+    f record;
+    r integer;
+    total integer := 0;
+    -- Owner of this function (the install owner / SECURITY DEFINER principal).
+    v_maint_owner name;
+    v_func_owner  name;
+    v_func_oid    oid;
+begin
+    -- Resolve install-owner name once per call (pg_get_userbyid avoids pg_authid).
+    select pg_catalog.pg_get_userbyid(p.proowner) into v_maint_owner
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'pgque'
+      and p.proname = 'maint'
+      and pg_catalog.pg_get_function_arguments(p.oid) = '';
+
+    for f in select func_name, func_arg from pgque.maint_operations()
+    loop
+        if f.func_name = 'pgque.maint_rotate_tables_step2' then
+            continue;
+        elsif f.func_name = 'vacuum' then
+            continue;
+        elsif f.func_arg is not null then
+            -- Resolve to regprocedure; invalid names raise a catchable exception.
+            begin
+                execute format('select %L::regprocedure', f.func_name || '(text)')
+                into v_func_oid;
+            exception when others then
+                raise warning 'pgque.maint: skipping % — invalid regprocedure: %', f.func_name, sqlerrm;
+                continue;
+            end;
+
+            -- Ownership check: extra-maint function must be owned by the install owner.
+            select pg_catalog.pg_get_userbyid(p.proowner) into v_func_owner
+            from pg_proc p
+            where p.oid = v_func_oid;
+
+            if v_func_owner is distinct from v_maint_owner then
+                raise warning 'pgque.maint: skipping % — owner % is not maint() owner %', f.func_name, v_func_owner, v_maint_owner;
+                continue;
+            end if;
+
+            execute 'select ' || f.func_name || '(' || quote_literal(f.func_arg) || ')' into r;
+            total := total + r;
+        else
+            execute 'select ' || f.func_name || '()' into r;
+            total := total + r;
+        end if;
+    end loop;
+
+    return total;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+grant execute on function pgque.maint() to pgque_admin;
+
+-- pgque-api/receive.sql
+-- pgque.receive(), pgque.ack(), pgque.nack() -- modern consume API
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+-- Includes code derived from PgQ (ISC license, Marko Kreen / Skype Technologies OU).
+--
+-- These functions wrap PgQ primitives (next_batch, get_batch_events,
+-- finish_batch, event_retry) into a simpler receive/ack/nack interface.
+-- See SPECx.md sections 4.2 and 4.3.
+
+-- pgque.message type (idempotent creation)
+do $$
+begin
+    if to_regtype('pgque.message') is null then
+        create type pgque.message as (
+            msg_id      bigint,
+            batch_id    bigint,
+            type        text,
+            payload     text,
+            retry_count int4,
+            created_at  timestamptz,
+            extra1      text,
+            extra2      text,
+            extra3      text,
+            extra4      text
+        );
+    end if;
+end $$;
+
+-- pgque.receive() -- wraps next_batch + get_batch_events
+create or replace function pgque.receive(
+    i_queue text, i_consumer text, i_max_return int default 100)
+returns setof pgque.message as $$
+declare
+    v_batch_id bigint;
+    ev record;
+    cnt int := 0;
+begin
+    if i_max_return < 1 then
+        raise exception 'pgque.receive: max_return must be >= 1, got %', i_max_return;
+    end if;
+
+    -- Get next batch (may return NULL if no tick window is ready)
+    v_batch_id := pgque.next_batch(i_queue, i_consumer);
+    if v_batch_id is null then
+        return;
+    end if;
+
+    -- Yield messages from the batch
+    for ev in
+        select ev_id, ev_type, ev_data, ev_retry, ev_time,
+               ev_extra1, ev_extra2, ev_extra3, ev_extra4
+        from pgque.get_batch_events(v_batch_id)
+    loop
+        return next row(
+            ev.ev_id, v_batch_id, ev.ev_type, ev.ev_data,
+            ev.ev_retry, ev.ev_time,
+            ev.ev_extra1, ev.ev_extra2, ev.ev_extra3, ev.ev_extra4
+        )::pgque.message;
+        cnt := cnt + 1;
+        exit when cnt >= i_max_return;
+    end loop;
+
+    -- Empty batch: finish immediately to advance the consumer cursor.
+    if cnt = 0 then
+        perform pgque.finish_batch(v_batch_id);
+    end if;
+
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.ack() -- finishes the batch, advances consumer position
+create or replace function pgque.ack(i_batch_id bigint)
+returns integer as $$
+begin
+    return pgque.finish_batch(i_batch_id);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.nack() -- retry or route to DLQ based on retry_count vs max_retries
+--
+-- Fix #98: re-query the canonical event row from the active batch using
+-- msg_id, instead of trusting caller-supplied pgque.message fields.
+-- A caller with an active batch could otherwise forge DLQ rows by
+-- supplying arbitrary ev_id / ev_type / ev_data in the composite.
+--
+-- Fix #104: DLQ insert is idempotent via ON CONFLICT in event_dead().
+-- Repeated nack() calls for the same terminal message produce exactly one
+-- dead_letter row.
+create or replace function pgque.nack(
+    i_batch_id bigint,
+    i_msg pgque.message,
+    i_retry_after interval default '60 seconds',
+    i_reason text default null)
+returns integer as $$
+declare
+    v_max_retries int4;
+    v_ev          record;
+begin
+    -- Lookup: subscription -> queue config
+    select coalesce(q.queue_max_retries, 5) into v_max_retries
+    from pgque.subscription s
+    join pgque.queue q on q.queue_id = s.sub_queue
+    where s.sub_batch = i_batch_id;
+
+    if not found then
+        raise exception 'batch not found: %', i_batch_id;
+    end if;
+
+    -- Re-query the canonical event from the active batch (#98).
+    -- This ignores caller-supplied payload/type/extras and uses the real
+    -- values stored in the queue data tables.
+    select ev_id, ev_time, ev_txid, ev_retry, ev_type, ev_data,
+           ev_extra1, ev_extra2, ev_extra3, ev_extra4
+    into v_ev
+    from pgque.get_batch_events(i_batch_id)
+    where ev_id = i_msg.msg_id;
+
+    if not found then
+        raise exception 'msg_id % not found in batch %', i_msg.msg_id, i_batch_id;
+    end if;
+
+    if coalesce(v_ev.ev_retry, 0) >= v_max_retries then
+        -- Move to dead letter queue using canonical event data (#98).
+        -- event_dead() uses ON CONFLICT DO NOTHING for idempotency (#104).
+        -- ev_txid is bigint in get_batch_events (legacy PgQ signature); text
+        -- round-trip is the codebase convention to widen to xid8 without loss.
+        perform pgque.event_dead(i_batch_id, v_ev.ev_id,
+            coalesce(i_reason, 'max retries exceeded'),
+            v_ev.ev_time, v_ev.ev_txid::text::xid8, v_ev.ev_retry,
+            v_ev.ev_type, v_ev.ev_data,
+            v_ev.ev_extra1, v_ev.ev_extra2, v_ev.ev_extra3, v_ev.ev_extra4);
+    else
+        -- Retry after delay
+        perform pgque.event_retry(i_batch_id, v_ev.ev_id,
+            extract(epoch from i_retry_after)::integer);
+    end if;
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- ---------------------------------------------------------------------------
+-- Grants
+-- ---------------------------------------------------------------------------
+-- receive/ack/nack are consumer-side: they open/close batches and route
+-- failed events to retry/DLQ. They go to pgque_reader, not pgque_writer.
+-- Apps that both produce and consume must hold both roles. See
+-- sql/pgque-additions/roles.sql for the producer/consumer split rationale
+-- (refs #102, #106; producer→consumer half. Consumer→consumer ownership
+-- is tracked separately in #164.)
+--
+-- Upgrade path: pre-#163 installs granted these to pgque_writer. Postgres
+-- preserves function-level grants across `create or replace function`, so
+-- explicitly revoke before re-granting on the new role.
+revoke execute on function pgque.receive(text, text, int)                    from pgque_writer;
+revoke execute on function pgque.ack(bigint)                                 from pgque_writer;
+revoke execute on function pgque.nack(bigint, pgque.message, interval, text) from pgque_writer;
+grant execute on function pgque.receive(text, text, int)                      to pgque_reader;
+grant execute on function pgque.ack(bigint)                                   to pgque_reader;
+grant execute on function pgque.nack(bigint, pgque.message, interval, text)   to pgque_reader;
+
+-- pgque-api/cooperative_consumers.sql
+-- pgque-api/cooperative_consumers.sql -- Experimental cooperative consumers API layer
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+--
+-- Cooperative-aware overrides extend PgQ-derived primitives.
+-- New cooperative APIs are clean-room; no code copied from pgq-coop.
+
+-- Cooperative consumer state marker. Existing rows remain normal on upgrade.
+alter table pgque.subscription
+  add column if not exists sub_role text not null default 'normal';
+
+do $$
+begin
+    if not exists (
+        select 1
+        from pg_catalog.pg_constraint
+        where
+            conrelid = 'pgque.subscription'::regclass
+            and conname = 'subscription_sub_role_check'
+    ) then
+        alter table pgque.subscription
+            add constraint subscription_sub_role_check
+            check (sub_role in ('normal', 'coop_main', 'coop_member'));
+    end if;
+end $$;
+
+create or replace function pgque.unregister_consumer(
+    x_queue_name text,
+    x_consumer_name text)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.unregister_consumer(2)
+--
+--      Unsubscribe consumer from the queue.
+--      Also consumer's retry events are deleted.
+--
+-- Parameters:
+--      x_queue_name        - Name of the queue
+--      x_consumer_name     - Name of the consumer
+--
+-- Returns:
+--      number of (sub)consumers unregistered
+-- Calls:
+--      None (direct DML only)
+-- Tables directly manipulated:
+--      delete - pgque.retry_queue
+--      delete - pgque.subscription
+--      update - pgque.subscription (last coop_member removed: demote coop_main back to 'normal')
+--      delete - pgque.consumer (when no subscriptions remain for the consumer)
+-- ----------------------------------------------------------------------
+declare
+    x_sub_id integer;
+    _sub_id_cnt integer;
+    _consumer_id integer;
+    _sub_role text;
+begin
+    select
+        s.sub_id,
+        c.co_id,
+        s.sub_role
+    into
+        x_sub_id,
+        _consumer_id,
+        _sub_role
+    from
+        pgque.subscription as s
+        inner join pgque.queue as q
+            on q.queue_id = s.sub_queue
+        inner join pgque.consumer as c
+            on c.co_id = s.sub_consumer
+    where
+        q.queue_name = x_queue_name
+        and c.co_name = x_consumer_name
+    for update of s, c;
+    if not found then
+        return 0;
+    end if;
+
+    -- consumer + subconsumer count
+    select count(*)
+    into _sub_id_cnt
+    from pgque.subscription
+    where sub_id = x_sub_id;
+
+    -- delete only one cooperative subconsumer
+    if _sub_id_cnt > 1 and _sub_role = 'coop_member' then
+        perform 1
+        from pgque.subscription
+        where
+            sub_id = x_sub_id
+            and sub_consumer = _consumer_id
+            and sub_batch is not null;
+        if found then
+            raise exception 'cannot unregister active cooperative subconsumer without forced batch handling';
+        end if;
+
+        delete from pgque.subscription
+        where
+            sub_id = x_sub_id
+            and sub_consumer = _consumer_id;
+
+        perform 1
+        from pgque.subscription
+        where sub_consumer = _consumer_id;
+        if not found then
+            delete from pgque.consumer
+            where co_id = _consumer_id;
+        end if;
+
+        if not exists (
+            select 1
+            from pgque.subscription
+            where
+                sub_id = x_sub_id
+                and sub_role = 'coop_member'
+        ) then
+            update pgque.subscription
+            set
+                sub_role = 'normal',
+                sub_active = now()
+            where
+                sub_id = x_sub_id
+                and sub_role = 'coop_main';
+        end if;
+
+        return 1;
+    else
+        -- Refuse implicit cooperative teardown through the legacy main
+        -- consumer API. Members must be unregistered explicitly so one
+        -- caller cannot wipe sibling subconsumers by guessing the main name.
+        if _sub_role = 'coop_main' then
+            perform 1
+            from pgque.subscription
+            where
+                sub_id = x_sub_id
+                and sub_role = 'coop_member';
+            if found then
+                raise exception 'cannot unregister cooperative main consumer with registered subconsumers';
+            end if;
+        end if;
+
+        -- delete main consumer (or a legacy single-row subscription)
+        perform 1
+        from pgque.subscription
+        where
+            sub_id = x_sub_id
+            and sub_role = 'coop_member'
+            and sub_batch is not null;
+        if found then
+            raise exception 'cannot unregister cooperative consumer with active subconsumer batches';
+        end if;
+
+        -- retry events
+        delete from pgque.retry_queue
+        where ev_owner = x_sub_id;
+
+        /*
+         * Delete the single normal/coop_main subscription. Member rows were
+         * already rejected above (cooperative teardown must go through
+         * unregister_subconsumer), so this only ever removes one row.
+         */
+        delete from pgque.subscription
+        where sub_id = x_sub_id;
+
+        perform 1
+        from pgque.subscription
+        where sub_consumer = _consumer_id;
+        if not found then
+            delete from pgque.consumer
+            where co_id = _consumer_id;
+        end if;
+
+        return _sub_id_cnt;
+    end if;
+
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.next_batch_custom(
+    in i_queue_name text,
+    in i_consumer_name text,
+    in i_min_lag interval,
+    in i_min_count int4,
+    in i_min_interval interval,
+    out batch_id int8,
+    out cur_tick_id int8,
+    out prev_tick_id int8,
+    out cur_tick_time timestamptz,
+    out prev_tick_time timestamptz,
+    out cur_tick_event_seq int8,
+    out prev_tick_event_seq int8)
+as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.next_batch_custom(5)
+--
+--      Makes next block of events active.  Block size can be tuned
+--      with i_min_count, i_min_interval parameters.  Events age can
+--      be tuned with i_min_lag.
+--
+--      If it returns NULL, there is no events available in queue.
+--      Consumer should sleep then.
+--
+--      The values from event_id sequence may give hint how big the
+--      batch may be.  But they are inexact, they do not give exact size.
+--      Client *MUST NOT* use them to detect whether the batch contains any
+--      events at all - the values are unfit for that purpose.
+--
+-- Note:
+--      i_min_lag together with i_min_interval/i_min_count is inefficient.
+--
+-- Parameters:
+--      i_queue_name        - Name of the queue
+--      i_consumer_name     - Name of the consumer
+--      i_min_lag           - Consumer wants events older than that
+--      i_min_count         - Consumer wants batch to contain at least this many events
+--      i_min_interval      - Consumer wants batch to cover at least this much time
+--
+-- Returns:
+--      batch_id            - Batch ID or NULL if there are no more events available.
+--      cur_tick_id         - End tick id.
+--      cur_tick_time       - End tick time.
+--      cur_tick_event_seq  - Value from event id sequence at the time tick was issued.
+--      prev_tick_id        - Start tick id.
+--      prev_tick_time      - Start tick time.
+--      prev_tick_event_seq - value from event id sequence at the time tick was issued.
+--
+-- pgque override note:
+--      This 5-arg form is the legacy non-cooperative API. Cooperative consumers
+--      must use the 7-arg pgque.next_batch_custom(queue, consumer, subconsumer,
+--      …, dead_interval) below. If the named (queue, consumer) resolves to a
+--      coop_main row that has at least one coop_member, this function raises
+--      with a directive to use the cooperative form. Coop_main rows without
+--      members behave as normal consumers and pass through.
+--
+-- Calls:
+--      pgque.find_tick_helper
+-- Tables directly manipulated:
+--      update - pgque.subscription
+-- Tables read:
+--      pgque.subscription (coop_main rejection EXISTS check), pgque.tick
+-- ----------------------------------------------------------------------
+declare
+    errmsg text;
+    queue_id integer;
+    cur_sub_id integer;
+    cons_id integer;
+    sub_role text;
+begin
+    select
+        s.sub_queue,
+        s.sub_consumer,
+        s.sub_id,
+        s.sub_batch,
+        s.sub_role,
+        t1.tick_id,
+        t1.tick_time,
+        t1.tick_event_seq,
+        t2.tick_id,
+        t2.tick_time,
+        t2.tick_event_seq
+    into
+        queue_id,
+        cons_id,
+        cur_sub_id,
+        batch_id,
+        sub_role,
+        prev_tick_id,
+        prev_tick_time,
+        prev_tick_event_seq,
+        cur_tick_id,
+        cur_tick_time,
+        cur_tick_event_seq
+    from
+        pgque.subscription as s
+        inner join pgque.queue as q
+            on q.queue_id = s.sub_queue
+        inner join pgque.consumer as c
+            on c.co_id = s.sub_consumer
+        left join pgque.tick as t1
+            on t1.tick_queue = s.sub_queue
+            and t1.tick_id = s.sub_last_tick
+        left join pgque.tick as t2
+            on t2.tick_queue = s.sub_queue
+            and t2.tick_id = s.sub_next_tick
+    where
+        q.queue_name = i_queue_name
+        and c.co_name = i_consumer_name
+    for update of s;
+    if not found then
+        errmsg := 'Not subscriber to queue: '
+            || coalesce(i_queue_name, 'NULL')
+            || '/'
+            || coalesce(i_consumer_name, 'NULL');
+        raise exception '%', errmsg;
+    end if;
+
+    if sub_role = 'coop_main' and exists (
+        select 1
+        from pgque.subscription as sx
+        where
+            sx.sub_queue = queue_id
+            and sx.sub_id = cur_sub_id
+            and sx.sub_role = 'coop_member'
+    ) then
+        raise exception 'consumer % on queue % is a cooperative main consumer; use cooperative receive/next_batch with a subconsumer', i_consumer_name, i_queue_name;
+    end if;
+
+    /*
+     * coop_member rows carry sub_last_tick = NULL by design (the main row
+     * owns the cursor), so the LEFT JOIN to pgque.tick above always yields
+     * prev_tick_id IS NULL for members. Reject explicitly here so callers
+     * see a directive to use the cooperative form instead of the misleading
+     * 'PgQ corruption' fallback raised by the prev_tick_id sanity check.
+     */
+    if sub_role = 'coop_member' then
+        raise exception 'consumer % on queue % is a cooperative subconsumer; use receive_coop / next_batch (cooperative form) instead of the legacy 5-arg next_batch_custom', i_consumer_name, i_queue_name;
+    end if;
+
+    -- sanity check
+    if prev_tick_id is null then
+        raise exception 'PgQ corruption: Consumer % on queue % does not see tick %', i_consumer_name, i_queue_name, prev_tick_id;
+    end if;
+
+    -- has already active batch
+    if batch_id is not null then
+        return;
+    end if;
+
+    if i_min_interval is null and i_min_count is null then
+        -- find next tick
+        select
+            tick_id,
+            tick_time,
+            tick_event_seq
+        into
+            cur_tick_id,
+            cur_tick_time,
+            cur_tick_event_seq
+        from pgque.tick
+        where
+            tick_id > prev_tick_id
+            and tick_queue = queue_id
+        order by
+            tick_queue asc,
+            tick_id asc
+        limit 1;
+    else
+        -- find custom tick
+        select
+            next_tick_id,
+            next_tick_time,
+            next_tick_seq
+        into
+            cur_tick_id,
+            cur_tick_time,
+            cur_tick_event_seq
+        from pgque.find_tick_helper(
+            queue_id,
+            prev_tick_id,
+            prev_tick_time,
+            prev_tick_event_seq,
+            i_min_count,
+            i_min_interval
+        );
+    end if;
+
+    if i_min_lag is not null then
+        -- enforce min lag
+        if now() - cur_tick_time < i_min_lag then
+            cur_tick_id := null;
+            cur_tick_time := null;
+            cur_tick_event_seq := null;
+        end if;
+    end if;
+
+    if cur_tick_id is null then
+        -- nothing to do
+        prev_tick_id := null;
+        prev_tick_time := null;
+        prev_tick_event_seq := null;
+        return;
+    end if;
+
+    -- get next batch
+    batch_id := nextval('pgque.batch_id_seq');
+    -- Defense in depth: filter on sub_role = 'normal' so a stray coop_main
+    -- row (e.g. memberless one that bypassed the rejection above) cannot be
+    -- stamped with sub_batch. With FOR UPDATE held since the initial SELECT,
+    -- sub_role cannot change here, so the filter is a guard against future
+    -- regressions rather than a fix for a reachable bug today. The column
+    -- name is qualified because the function declares a local PL/pgSQL
+    -- variable also named sub_role.
+    update pgque.subscription
+    set
+        sub_batch = batch_id,
+        sub_next_tick = cur_tick_id,
+        sub_active = now()
+    where
+        sub_queue = queue_id
+        and sub_consumer = cons_id
+        and pgque.subscription.sub_role = 'normal';
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.finish_batch(
+    x_batch_id bigint)
+returns integer as $$
+-- ----------------------------------------------------------------------
+-- Function: pgque.finish_batch(1)
+--
+--      Closes a batch.  No more operations can be done with events
+--      of this batch.
+--
+-- Parameters:
+--      x_batch_id      - id of batch.
+--
+-- Returns:
+--      1 if batch was found, 0 otherwise.
+-- Calls:
+--      pgque._clear_member_cursor (coop_member branch)
+-- Tables directly manipulated:
+--      update - pgque.subscription
+-- ----------------------------------------------------------------------
+declare
+    v_sub record;
+begin
+    select *
+    into v_sub
+    from pgque.subscription
+    where sub_batch = x_batch_id
+    for update;
+    if not found then
+        raise warning 'finish_batch: batch % not found', x_batch_id;
+        return 0;
+    end if;
+
+    if v_sub.sub_role = 'coop_main' then
+        raise exception 'cannot finish cooperative main consumer batch % as normal active consumer', x_batch_id;
+    elsif v_sub.sub_role = 'coop_member' then
+        perform pgque._clear_member_cursor(v_sub.sub_queue, v_sub.sub_consumer);
+    else
+        update pgque.subscription
+        set
+            sub_active = now(),
+            sub_last_tick = sub_next_tick,
+            sub_next_tick = null,
+            sub_batch = null
+        where
+            sub_queue = v_sub.sub_queue
+            and sub_consumer = v_sub.sub_consumer;
+    end if;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque cooperative consumers (experimental in PgQue 0.2)
+create or replace function pgque._validate_coop_names(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text)
+returns void as $$
+begin
+    if i_queue is null or i_queue = '' then
+        raise exception 'queue name must not be empty';
+    end if;
+    if i_consumer is null or i_consumer = '' then
+        raise exception 'consumer name must not be empty';
+    end if;
+    if i_subconsumer is null or i_subconsumer = '' then
+        raise exception 'subconsumer name must not be empty';
+    end if;
+    if position('.' in i_consumer) > 0 then
+        raise exception 'cooperative consumer name must not contain dot: %', i_consumer;
+    end if;
+    if position('.' in i_subconsumer) > 0 then
+        raise exception 'cooperative subconsumer name must not contain dot: %', i_subconsumer;
+    end if;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- Reset a coop_member subscription's batch token + tick window. Member rows
+-- never advance sub_last_tick on their own — the main consumer owns the
+-- cursor — so clearing both ticks releases the member without losing position.
+create or replace function pgque._clear_member_cursor(
+    p_queue_id int4,
+    p_consumer_id int4)
+returns void as $$
+begin
+    update pgque.subscription
+    set
+        sub_active = now(),
+        sub_last_tick = null,
+        sub_next_tick = null,
+        sub_batch = null
+    where
+        sub_queue = p_queue_id
+        and sub_consumer = p_consumer_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+drop function if exists pgque.subscribe_subconsumer(text, text, text);
+drop function if exists pgque.register_subconsumer(text, text, text);
+
+create or replace function pgque.register_subconsumer(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text,
+    i_convert_normal boolean default false)
+returns integer as $$
+declare
+    v_queue_id int4;
+    v_main_consumer_id int4;
+    v_member_consumer_id int4;
+    v_main record;
+    v_member record;
+    v_member_name text;
+    v_last_tick bigint;
+    v_created integer := 0;
+begin
+    perform pgque._validate_coop_names(i_queue, i_consumer, i_subconsumer);
+    v_member_name := i_consumer || '.' || i_subconsumer;
+
+    select queue_id
+    into v_queue_id
+    from pgque.queue
+    where queue_name = i_queue;
+    if not found then
+        raise exception 'Event queue not created yet';
+    end if;
+
+    select co_id
+    into v_main_consumer_id
+    from pgque.consumer
+    where co_name = i_consumer
+    for update;
+    if not found then
+        insert into pgque.consumer (co_name)
+        values (i_consumer)
+        returning co_id into v_main_consumer_id;
+    end if;
+
+    select *
+    into v_main
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_main_consumer_id
+    for update;
+    if not found then
+        select tick_id
+        into v_last_tick
+        from pgque.tick
+        where tick_queue = v_queue_id
+        order by
+            tick_queue desc,
+            tick_id desc
+        limit 1;
+        if not found then
+            raise exception 'No ticks for this queue.  Please run ticker on database.';
+        end if;
+
+        insert into pgque.subscription (
+            sub_queue,
+            sub_consumer,
+            sub_last_tick,
+            sub_role
+        )
+        values (
+            v_queue_id,
+            v_main_consumer_id,
+            v_last_tick,
+            'coop_main'
+        )
+        returning * into v_main;
+        v_created := 1;
+    elsif v_main.sub_role = 'normal' then
+        if not i_convert_normal then
+            raise exception 'consumer % on queue % is already a normal consumer; explicit conversion is required', i_consumer, i_queue;
+        end if;
+        if v_main.sub_batch is not null then
+            raise exception 'cannot convert active normal consumer % on queue % to cooperative main', i_consumer, i_queue;
+        end if;
+
+        update pgque.subscription
+        set
+            sub_role = 'coop_main',
+            sub_active = now()
+        where
+            sub_queue = v_queue_id
+            and sub_consumer = v_main_consumer_id
+        returning * into v_main;
+    elsif v_main.sub_role <> 'coop_main' then
+        raise exception 'consumer % on queue % is not a cooperative main consumer', i_consumer, i_queue;
+    end if;
+
+    select co_id
+    into v_member_consumer_id
+    from pgque.consumer
+    where co_name = v_member_name
+    for update;
+    if not found then
+        insert into pgque.consumer (co_name)
+        values (v_member_name)
+        returning co_id into v_member_consumer_id;
+    end if;
+
+    select *
+    into v_member
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_member_consumer_id
+    for update;
+    if found then
+        if v_member.sub_role <> 'coop_member' or v_member.sub_id <> v_main.sub_id then
+            raise exception 'consumer name % on queue % is already registered incompatibly', v_member_name, i_queue;
+        end if;
+
+        update pgque.subscription
+        set sub_active = now()
+        where
+            sub_queue = v_queue_id
+            and sub_consumer = v_member_consumer_id;
+        return v_created;
+    end if;
+
+    insert into pgque.subscription (
+        sub_id,
+        sub_queue,
+        sub_consumer,
+        sub_last_tick,
+        sub_active,
+        sub_batch,
+        sub_next_tick,
+        sub_role
+    )
+    values (
+        v_main.sub_id,
+        v_queue_id,
+        v_member_consumer_id,
+        null,
+        now(),
+        null,
+        null,
+        'coop_member'
+    );
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.subscribe_subconsumer(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text,
+    i_convert_normal boolean default false)
+returns integer as $$
+begin
+    return pgque.register_subconsumer(i_queue, i_consumer, i_subconsumer, i_convert_normal);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.touch_subconsumer(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text)
+returns integer as $$
+declare
+    v_member_name text;
+    v_cnt integer;
+begin
+    perform pgque._validate_coop_names(i_queue, i_consumer, i_subconsumer);
+    v_member_name := i_consumer || '.' || i_subconsumer;
+
+    update pgque.subscription as s
+    set sub_active = clock_timestamp()
+    from
+        pgque.queue as q
+        cross join pgque.consumer as c
+    where
+        q.queue_name = i_queue
+        and c.co_name = v_member_name
+        and s.sub_queue = q.queue_id
+        and s.sub_consumer = c.co_id
+        and s.sub_role = 'coop_member';
+    get diagnostics v_cnt = row_count;
+    return v_cnt;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.next_batch_custom(
+    in i_queue text,
+    in i_consumer text,
+    in i_subconsumer text,
+    in i_min_lag interval,
+    in i_min_count int4,
+    in i_min_interval interval,
+    in i_dead_interval interval default null,
+    out batch_id bigint,
+    out prev_tick_id bigint,
+    out next_tick_id bigint)
+as $$
+declare
+    v_queue_id int4;
+    v_main_consumer_id int4;
+    v_member_consumer_id int4;
+    v_member_name text;
+    v_main record;
+    v_member record;
+    v_victim record;
+    v_prev_tick_time timestamptz;
+    v_prev_tick_event_seq bigint;
+    v_next_tick_time timestamptz;
+    v_next_tick_event_seq bigint;
+begin
+    perform pgque.register_subconsumer(i_queue, i_consumer, i_subconsumer);
+    v_member_name := i_consumer || '.' || i_subconsumer;
+
+    select
+        q.queue_id,
+        c.co_id
+    into
+        v_queue_id,
+        v_main_consumer_id
+    from
+        pgque.queue as q
+        cross join pgque.consumer as c
+    where
+        q.queue_name = i_queue
+        and c.co_name = i_consumer;
+
+    select *
+    into v_main
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_main_consumer_id
+        and sub_role = 'coop_main'
+    for update;
+    if not found then
+        raise exception 'cooperative main consumer not found: %/%', i_queue, i_consumer;
+    end if;
+
+    select co_id
+    into v_member_consumer_id
+    from pgque.consumer
+    where co_name = v_member_name;
+
+    select *
+    into v_member
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_member_consumer_id
+        and sub_id = v_main.sub_id
+        and sub_role = 'coop_member'
+    for update;
+    if not found then
+        raise exception 'cooperative subconsumer not found: %/%/%', i_queue, i_consumer, i_subconsumer;
+    end if;
+
+    if v_member.sub_batch is not null then
+        update pgque.subscription
+        set sub_active = now()
+        where
+            sub_queue = v_member.sub_queue
+            and sub_consumer = v_member.sub_consumer;
+        batch_id := v_member.sub_batch;
+        prev_tick_id := v_member.sub_last_tick;
+        next_tick_id := v_member.sub_next_tick;
+        return;
+    end if;
+
+    if i_dead_interval is not null then
+        select *
+        into v_victim
+        from pgque.subscription
+        where
+            sub_queue = v_main.sub_queue
+            and sub_id = v_main.sub_id
+            and sub_role = 'coop_member'
+            and sub_consumer <> v_member.sub_consumer
+            and sub_batch is not null
+            and sub_active < now() - i_dead_interval
+        order by
+            sub_active asc,
+            sub_consumer asc
+        for update skip locked
+        limit 1;
+        if found then
+            batch_id := nextval('pgque.batch_id_seq');
+            update pgque.subscription
+            set
+                sub_active = now(),
+                sub_last_tick = v_victim.sub_last_tick,
+                sub_next_tick = v_victim.sub_next_tick,
+                sub_batch = batch_id
+            where
+                sub_queue = v_member.sub_queue
+                and sub_consumer = v_member.sub_consumer;
+            perform pgque._clear_member_cursor(v_victim.sub_queue, v_victim.sub_consumer);
+            prev_tick_id := v_victim.sub_last_tick;
+            next_tick_id := v_victim.sub_next_tick;
+            return;
+        end if;
+    end if;
+
+    if v_main.sub_batch is not null then
+        raise exception 'cooperative main consumer %/% has an unexpected active batch %', i_queue, i_consumer, v_main.sub_batch;
+    end if;
+    if v_main.sub_last_tick is null then
+        raise exception 'PgQ corruption: cooperative main consumer % on queue % has no cursor', i_consumer, i_queue;
+    end if;
+
+    select
+        tick_time,
+        tick_event_seq
+    into
+        v_prev_tick_time,
+        v_prev_tick_event_seq
+    from pgque.tick
+    where
+        tick_queue = v_queue_id
+        and tick_id = v_main.sub_last_tick;
+    if not found then
+        raise exception 'PgQ corruption: cooperative main consumer % on queue % does not see tick %', i_consumer, i_queue, v_main.sub_last_tick;
+    end if;
+
+    if i_min_interval is null and i_min_count is null then
+        select
+            tick_id,
+            tick_time,
+            tick_event_seq
+        into
+            next_tick_id,
+            v_next_tick_time,
+            v_next_tick_event_seq
+        from pgque.tick
+        where
+            tick_id > v_main.sub_last_tick
+            and tick_queue = v_queue_id
+        order by
+            tick_queue asc,
+            tick_id asc
+        limit 1;
+    else
+        select
+            h.next_tick_id,
+            h.next_tick_time,
+            h.next_tick_seq
+        into
+            next_tick_id,
+            v_next_tick_time,
+            v_next_tick_event_seq
+        from pgque.find_tick_helper(
+            v_queue_id,
+            v_main.sub_last_tick,
+            v_prev_tick_time,
+            v_prev_tick_event_seq,
+            i_min_count,
+            i_min_interval
+        ) as h;
+    end if;
+
+    if i_min_lag is not null and next_tick_id is not null then
+        if now() - v_next_tick_time < i_min_lag then
+            next_tick_id := null;
+        end if;
+    end if;
+
+    if next_tick_id is null then
+        /*
+         * Empty tick window: no batch allocated, no cursor advance.
+         * sub_active is intentionally NOT refreshed here. The dead-interval
+         * takeover query above requires sub_batch is not null, so an idle
+         * member with stale sub_active cannot be victimized — refreshing
+         * would just hide a worker that has stopped polling. Active members
+         * (sub_batch is not null) refresh sub_active on the active-batch
+         * return path; touch_subconsumer is the explicit heartbeat for idle
+         * members that need to keep their identity warm.
+         */
+        prev_tick_id := null;
+        return;
+    end if;
+
+    prev_tick_id := v_main.sub_last_tick;
+    batch_id := nextval('pgque.batch_id_seq');
+
+    update pgque.subscription
+    set
+        sub_active = now(),
+        sub_last_tick = next_tick_id,
+        sub_next_tick = null,
+        sub_batch = null
+    where
+        sub_queue = v_main.sub_queue
+        and sub_consumer = v_main.sub_consumer;
+
+    update pgque.subscription
+    set
+        sub_active = now(),
+        sub_last_tick = prev_tick_id,
+        sub_next_tick = next_tick_id,
+        sub_batch = batch_id
+    where
+        sub_queue = v_member.sub_queue
+        and sub_consumer = v_member.sub_consumer;
+
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.next_batch(
+    in i_queue text,
+    in i_consumer text,
+    in i_subconsumer text,
+    in i_dead_interval interval default null)
+returns bigint as $$
+declare
+    v_batch_id bigint;
+begin
+    select batch_id
+    into v_batch_id
+    from pgque.next_batch_custom(
+            i_queue,
+            i_consumer,
+            i_subconsumer,
+            null,
+            null,
+            null,
+            i_dead_interval
+        );
+    return v_batch_id;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.unregister_subconsumer(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text,
+    i_batch_handling integer default 0)
+returns integer as $$
+declare
+    v_queue_id int4;
+    v_main_consumer_id int4;
+    v_member_consumer_id int4;
+    v_member_name text;
+    v_main record;
+    v_member record;
+    v_ev record;
+    v_max_retries int4;
+    v_remaining integer;
+begin
+    perform pgque._validate_coop_names(i_queue, i_consumer, i_subconsumer);
+    if i_batch_handling not in (0, 1) then
+        raise exception 'unsupported batch_handling value: %', i_batch_handling;
+    end if;
+    v_member_name := i_consumer || '.' || i_subconsumer;
+
+    select
+        q.queue_id,
+        c.co_id,
+        coalesce(q.queue_max_retries, 5)
+    into
+        v_queue_id,
+        v_main_consumer_id,
+        v_max_retries
+    from
+        pgque.queue as q
+        cross join pgque.consumer as c
+    where
+        q.queue_name = i_queue
+        and c.co_name = i_consumer;
+    if not found then
+        return 0;
+    end if;
+
+    select *
+    into v_main
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_main_consumer_id
+        and sub_role = 'coop_main'
+    for update;
+    if not found then
+        return 0;
+    end if;
+
+    select co_id
+    into v_member_consumer_id
+    from pgque.consumer
+    where co_name = v_member_name;
+    if not found then
+        return 0;
+    end if;
+
+    select *
+    into v_member
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_member_consumer_id
+        and sub_id = v_main.sub_id
+        and sub_role = 'coop_member'
+    for update;
+    if not found then
+        return 0;
+    end if;
+
+    if v_member.sub_batch is not null then
+        if i_batch_handling = 0 then
+            raise exception 'cannot unregister active cooperative subconsumer %/%/% without batch_handling = 1', i_queue, i_consumer, i_subconsumer;
+        end if;
+
+        for v_ev in
+            select
+                ev_id,
+                ev_time,
+                ev_txid,
+                ev_retry,
+                ev_type,
+                ev_data,
+                ev_extra1,
+                ev_extra2,
+                ev_extra3,
+                ev_extra4
+            from pgque.get_batch_events(v_member.sub_batch)
+        loop
+            if coalesce(v_ev.ev_retry, 0) >= v_max_retries then
+                /*
+                 * ev_txid is bigint in get_batch_events (legacy PgQ
+                 * signature); the text round-trip is the codebase
+                 * convention to widen to xid8 without precision loss
+                 * (see pgque.nack() for the same pattern).
+                 */
+                perform pgque.event_dead(
+                    v_member.sub_batch,
+                    v_ev.ev_id,
+                    'subconsumer unregistered',
+                    v_ev.ev_time,
+                    v_ev.ev_txid::text::xid8,
+                    v_ev.ev_retry,
+                    v_ev.ev_type,
+                    v_ev.ev_data,
+                    v_ev.ev_extra1,
+                    v_ev.ev_extra2,
+                    v_ev.ev_extra3,
+                    v_ev.ev_extra4
+                );
+            else
+                /*
+                 * 60 second retry delay matches pgque.nack()'s default
+                 * (i_retry_after default '60 seconds'). Per-queue retry
+                 * intervals are not configurable today; if that changes,
+                 * read it alongside queue_max_retries above and pass it
+                 * here.
+                 */
+                perform pgque.event_retry(v_member.sub_batch, v_ev.ev_id, 60);
+            end if;
+        end loop;
+
+        perform pgque._clear_member_cursor(v_member.sub_queue, v_member.sub_consumer);
+    end if;
+
+    delete from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_consumer = v_member_consumer_id;
+
+    perform 1
+    from pgque.subscription
+    where sub_consumer = v_member_consumer_id;
+    if not found then
+        delete from pgque.consumer
+        where co_id = v_member_consumer_id;
+    end if;
+
+    select count(*)
+    into v_remaining
+    from pgque.subscription
+    where
+        sub_queue = v_queue_id
+        and sub_id = v_main.sub_id
+        and sub_role = 'coop_member';
+    if v_remaining = 0 then
+        update pgque.subscription
+        set
+            sub_role = 'normal',
+            sub_active = now()
+        where
+            sub_queue = v_queue_id
+            and sub_consumer = v_main_consumer_id
+            and sub_role = 'coop_main';
+    end if;
+
+    return 1;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.unsubscribe_subconsumer(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text,
+    i_batch_handling integer default 0)
+returns integer as $$
+begin
+    return pgque.unregister_subconsumer(i_queue, i_consumer, i_subconsumer, i_batch_handling);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+create or replace function pgque.receive_coop(
+    i_queue text,
+    i_consumer text,
+    i_subconsumer text,
+    i_max_return int default 100,
+    i_dead_interval interval default null)
+returns setof pgque.message as $$
+declare
+    v_batch_id bigint;
+    ev record;
+    cnt int := 0;
+begin
+    if i_max_return < 1 then
+        raise exception 'pgque.receive_coop: max_return must be >= 1, got %', i_max_return;
+    end if;
+
+    v_batch_id := pgque.next_batch(i_queue, i_consumer, i_subconsumer, i_dead_interval);
+    if v_batch_id is null then
+        return;
+    end if;
+
+    for ev in
+        select
+            ev_id,
+            ev_type,
+            ev_data,
+            ev_retry,
+            ev_time,
+            ev_extra1,
+            ev_extra2,
+            ev_extra3,
+            ev_extra4
+        from pgque.get_batch_events(v_batch_id)
+    loop
+        return next row(
+            ev.ev_id,
+            v_batch_id,
+            ev.ev_type,
+            ev.ev_data,
+            ev.ev_retry,
+            ev.ev_time,
+            ev.ev_extra1,
+            ev.ev_extra2,
+            ev.ev_extra3,
+            ev.ev_extra4
+        )::pgque.message;
+        cnt := cnt + 1;
+        exit when cnt >= i_max_return;
+    end loop;
+
+    -- Empty batch: release the member token so the subconsumer is not wedged
+    -- on a tick window with no visible events. finish_batch on a coop_member
+    -- clears sub_batch + sub_last_tick + sub_next_tick (it does not advance
+    -- the main cursor, which already moved when the batch was allocated).
+    if cnt = 0 then
+        perform pgque.finish_batch(v_batch_id);
+    end if;
+
+    return;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- ---------------------------------------------------------------------------
+-- Experimental API comments + grants
+-- ---------------------------------------------------------------------------
+-- Cooperative consumer functions are consumer-side and go to pgque_reader.
+-- See sql/pgque-additions/roles.sql for the producer/consumer split.
+
+comment on function pgque.register_subconsumer(text, text, text, boolean) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.unregister_subconsumer(text, text, text, integer) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.subscribe_subconsumer(text, text, text, boolean) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.unsubscribe_subconsumer(text, text, text, integer) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.next_batch(text, text, text, interval) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.next_batch_custom(text, text, text, interval, int4, interval, interval) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.receive_coop(text, text, text, int, interval) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+comment on function pgque.touch_subconsumer(text, text, text) is
+    'Experimental in PgQue 0.2. Function names, edge-case behavior, and client API shape may change before this feature is marked stable. Do not use this as the only processing path for critical workloads without idempotent handlers and stale-worker takeover tests.';
+
+grant execute on function pgque.register_subconsumer(text, text, text, boolean) to pgque_reader;
+grant execute on function pgque.unregister_subconsumer(text, text, text, integer) to pgque_reader;
+grant execute on function pgque.subscribe_subconsumer(text, text, text, boolean) to pgque_reader;
+grant execute on function pgque.unsubscribe_subconsumer(text, text, text, integer) to pgque_reader;
+grant execute on function pgque.next_batch(text, text, text, interval) to pgque_reader;
+grant execute on function pgque.next_batch_custom(text, text, text, interval, int4, interval, interval) to pgque_reader;
+grant execute on function pgque.receive_coop(text, text, text, int, interval) to pgque_reader;
+grant execute on function pgque.touch_subconsumer(text, text, text) to pgque_reader;
+
+-- pgque-api/send.sql
+-- pgque-api/send.sql -- Modern send/subscribe API layer
+-- Copyright 2026 Nikolay Samokhvalov. Apache-2.0 license.
+-- Includes code derived from PgQ (ISC license, Marko Kreen / Skype Technologies OU).
+--
+-- Implements default v0.1 API surface:
+--   pgque.message type
+--   pgque.send(queue, payload)                -- text + jsonb overloads
+--   pgque.send(queue, type, payload)          -- text + jsonb overloads
+--   pgque.send_batch(queue, type, payloads[]) -- text[] + jsonb[] overloads
+--   pgque.subscribe(queue, consumer)
+--   pgque.unsubscribe(queue, consumer)
+--
+-- Overload resolution note: PostgreSQL resolves untyped string literals
+-- (type `unknown`) to the `text` overload because `unknown -> text` needs
+-- no implicit cast, while `unknown -> jsonb` does. Consequently:
+--
+--   select pgque.send('orders', '{"k":1}');           -- picks send(text, text)
+--   select pgque.send('orders', '{"k":1}'::jsonb);    -- picks send(text, jsonb)
+--
+-- The `text` overloads are the default for untyped literals: bytes flow
+-- through verbatim (no parse, no canonicalization, key order preserved)
+-- for *textual* payloads -- JSON, XML, CSV, or binary that has already
+-- been base64/hex-encoded. PostgreSQL `text` cannot store NUL (\x00),
+-- so true binary payloads (raw protobuf, msgpack, Avro, bytea dumps)
+-- must be caller-encoded before `send()` -- otherwise PG rejects the
+-- insert with `invalid byte sequence`.
+-- The `jsonb` overloads are opt-in via explicit `::jsonb` cast: PG
+-- validates JSON at parse time and stores the canonical form.
+-- Storage (ev_data TEXT) is identical in both paths.
+
+-- pgque.message type (idempotent creation)
+do $$
+begin
+    if to_regtype('pgque.message') is null then
+        create type pgque.message as (
+            msg_id      bigint,       -- ev_id
+            batch_id    bigint,       -- batch containing this message
+            type        text,         -- ev_type
+            payload     text,         -- ev_data (caller casts to jsonb if needed)
+            retry_count int4,         -- ev_retry (NULL for first delivery)
+            created_at  timestamptz,  -- ev_time
+            extra1      text,         -- ev_extra1
+            extra2      text,         -- ev_extra2
+            extra3      text,         -- ev_extra3
+            extra4      text          -- ev_extra4
+        );
+    end if;
+end $$;
+
+-- v0.1.0 shipped these public wrappers with i_* argument names.
+-- PostgreSQL rejects CREATE OR REPLACE FUNCTION when input argument names
+-- change, even when the signature is otherwise identical. Drop only those
+-- old wrappers before recreating them with the stable v0.2 API names so the
+-- documented "re-run sql/pgque.sql to upgrade" path works from v0.1.0.
+-- Do not unconditionally drop current wrappers: users may have dependent
+-- views/functions, and normal idempotent reinstall must preserve those OIDs.
+-- Also preserve the old function owner when the upgrade is run by a superuser:
+-- dropped SECURITY DEFINER wrappers must not silently become superuser-owned.
+create temporary table if not exists pgque_v01_wrapper_owners (
+    sig text primary key,
+    owner_name name not null
+);
+
+do $$
+declare
+    v_sig text;
+    proc regprocedure;
+    args text;
+    v_owner_name name;
+begin
+    foreach v_sig in array array[
+        'pgque.send(text,jsonb)',
+        'pgque.send(text,text)',
+        'pgque.send(text,text,jsonb)',
+        'pgque.send(text,text,text)',
+        'pgque.send_batch(text,text,jsonb[])',
+        'pgque.send_batch(text,text,text[])',
+        'pgque.subscribe(text,text)',
+        'pgque.unsubscribe(text,text)'
+    ] loop
+        proc := to_regprocedure(v_sig);
+        if proc is null then
+            continue;
+        end if;
+
+        args := pg_get_function_arguments(proc);
+        if args like 'i\_%' escape '\' then
+            select r.rolname
+            into v_owner_name
+            from pg_proc as p
+            join pg_roles as r on r.oid = p.proowner
+            where p.oid = proc::oid;
+
+            insert into pg_temp.pgque_v01_wrapper_owners (sig, owner_name)
+            values (v_sig, v_owner_name)
+            on conflict (sig) do update
+                set owner_name = excluded.owner_name;
+
+            execute format('drop function %s', proc);
+        end if;
+    end loop;
+end $$;
+
+-- pgque.send(queue, payload jsonb) -- send with default type, JSON payload
+create or replace function pgque.send(queue_name text, payload jsonb)
+returns bigint as $$
+begin
+    return pgque.insert_event(queue_name, 'default', payload::text);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send(text, jsonb) from public;
+
+-- pgque.send(queue, payload text) -- fast path, opaque textual payload
+-- Skips the jsonb parse + canonical reserialize round-trip. Use this when
+-- the payload is text (JSON, XML, CSV, base64/hex-encoded binary) or when
+-- the caller has already validated the payload. Raw binary with NUL bytes
+-- (protobuf, msgpack, Avro wire format) is not accepted by PG `text` --
+-- encode first.
+create or replace function pgque.send(queue_name text, payload text)
+returns bigint as $$
+begin
+    return pgque.insert_event(queue_name, 'default', payload);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send(text, text) from public;
+
+-- pgque.send(queue, type, payload jsonb) -- send with explicit type, JSON payload
+create or replace function pgque.send(queue_name text, type_name text, payload jsonb)
+returns bigint as $$
+begin
+    return pgque.insert_event(queue_name, type_name, payload::text);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send(text, text, jsonb) from public;
+
+-- pgque.send(queue, type, payload text) -- fast path with explicit type
+create or replace function pgque.send(queue_name text, type_name text, payload text)
+returns bigint as $$
+begin
+    return pgque.insert_event(queue_name, type_name, payload);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send(text, text, text) from public;
+
+-- pgque.insert_event_bulk(queue, type, payloads text[]) -- internal set-based primitive
+-- Deliberately does not call insert_event_raw(): batch send needs one table
+-- lookup, one disable-insert check, and one insert ... select for the whole
+-- array. Keep the queue lookup / queue_disable_insert replica-bypass logic in
+-- sync with insert_event_raw() when either path changes.
+create or replace function pgque.insert_event_bulk(
+    queue_name text, ev_type text, ev_data_list text[])
+returns bigint[] as $$
+declare
+    -- Local aliases avoid ambiguity with table columns inside SQL statements.
+    _queue_name alias for $1;
+    _ev_type alias for $2;
+    _ev_data_list alias for $3;
+    qstate record;
+    v_ids bigint[];
+begin
+    select
+        pgque.quote_fqname(q.queue_data_pfx || '_' || q.queue_cur_table::text) as cur_table_name,
+        q.queue_event_seq::regclass as queue_event_seq,
+        q.queue_disable_insert
+    into qstate
+    from pgque.queue q
+    where q.queue_name = _queue_name;
+
+    if not found then
+        raise exception 'queue not found: %', _queue_name;
+    end if;
+
+    if qstate.queue_disable_insert then
+        -- Keep upstream PgQ semantics: disabled queues still accept inserts
+        -- when session_replication_role = 'replica'. This is likely for
+        -- replication/load paths such as Londiste; send_batch() must match
+        -- insert_event_raw()/insert_event() behavior instead of inventing a
+        -- stricter batch-only rule.
+        if current_setting('session_replication_role') <> 'replica' then
+            raise exception 'Insert into queue disallowed';
+        end if;
+    end if;
+
+    execute format($sql$
+        with input as materialized (
+            select
+                u.ord,
+                u.payload as ev_data
+            from unnest($2::text[]) with ordinality as u(payload, ord)
+        ), numbered as materialized (
+            select
+                ord,
+                nextval($1) as ev_id,
+                ev_data
+            from input
+            order by ord
+        ), ins as (
+            insert into %s (
+                ev_id, ev_time, ev_owner, ev_retry,
+                ev_type, ev_data, ev_extra1, ev_extra2, ev_extra3, ev_extra4
+            )
+            select
+                ev_id, $3, null, null,
+                $4, ev_data, null, null, null, null
+            from numbered
+            -- Return order is handled below by array_agg(... order by ord);
+            -- this keeps physical insertion broadly aligned with input order.
+            order by ord
+            returning ev_id
+        )
+        select coalesce(array_agg(numbered.ev_id order by numbered.ord), '{}'::bigint[])
+        from numbered
+        join ins using (ev_id)
+    $sql$, qstate.cur_table_name)
+    into v_ids
+    using qstate.queue_event_seq, _ev_data_list, now(), _ev_type;
+
+    return v_ids;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.send_batch(queue, payloads jsonb[]) -- default-type batch send
+create or replace function pgque.send_batch(queue_name text, payloads jsonb[])
+returns bigint[] as $$
+begin
+    return pgque.send_batch(queue_name, 'default', payloads);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send_batch(text, jsonb[]) from public;
+
+-- pgque.send_batch(queue, type, payloads jsonb[]) -- set-based batch send
+create or replace function pgque.send_batch(
+    queue_name text, type_name text, payloads jsonb[])
+returns bigint[] as $$
+begin
+    if payloads is null then
+        raise exception 'payloads must not be null';
+    end if;
+    if cardinality(payloads) = 0 then
+        return '{}'::bigint[];
+    end if;
+
+    return pgque.insert_event_bulk(queue_name, type_name, payloads::text[]);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send_batch(text, text, jsonb[]) from public;
+
+-- pgque.send_batch(queue, payloads text[]) -- default-type fast-path batch send
+create or replace function pgque.send_batch(queue_name text, payloads text[])
+returns bigint[] as $$
+begin
+    return pgque.send_batch(queue_name, 'default', payloads);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send_batch(text, text[]) from public;
+
+-- pgque.send_batch(queue, type, payloads text[]) -- set-based fast-path batch send
+create or replace function pgque.send_batch(
+    queue_name text, type_name text, payloads text[])
+returns bigint[] as $$
+begin
+    if payloads is null then
+        raise exception 'payloads must not be null';
+    end if;
+    if cardinality(payloads) = 0 then
+        return '{}'::bigint[];
+    end if;
+
+    return pgque.insert_event_bulk(queue_name, type_name, payloads);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send_batch(text, text, text[]) from public;
+
+-- pgque.subscribe(queue, consumer) -- wrapper for register_consumer
+create or replace function pgque.subscribe(queue text, consumer text)
+returns integer as $$
+begin
+    return pgque.register_consumer(queue, consumer);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.subscribe(text, text) from public;
+
+-- pgque.unsubscribe(queue, consumer) -- wrapper for unregister_consumer
+create or replace function pgque.unsubscribe(queue text, consumer text)
+returns integer as $$
+begin
+    return pgque.unregister_consumer(queue, consumer);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.unsubscribe(text, text) from public;
+
+-- Restore owners for wrappers that had to be dropped during v0.1.0 upgrade.
+do $$
+declare
+    rec record;
+    proc regprocedure;
+begin
+    if to_regclass('pg_temp.pgque_v01_wrapper_owners') is null then
+        return;
+    end if;
+
+    for rec in select sig, owner_name from pg_temp.pgque_v01_wrapper_owners
+    loop
+        proc := to_regprocedure(rec.sig);
+        if proc is not null then
+            execute format('alter function %s owner to %I', proc, rec.owner_name);
+
+            -- Restored v0.1.0 send_batch wrappers are SECURITY DEFINER and
+            -- call the new v0.2.0 internal bulk primitive. Preserve runtime
+            -- behavior for non-superuser owners by granting just that owner
+            -- execute on the primitive their wrapper now needs. The grant is
+            -- intentionally persistent: the restored wrapper keeps calling
+            -- this locked-down primitive on later idempotent reinstalls.
+            if rec.sig in (
+                'pgque.send_batch(text,text,jsonb[])',
+                'pgque.send_batch(text,text,text[])'
+            ) then
+                execute format(
+                    'grant execute on function pgque.insert_event_bulk(text, text, text[]) to %I',
+                    rec.owner_name
+                );
+            end if;
+        end if;
+    end loop;
+end $$;
+
+drop table if exists pg_temp.pgque_v01_wrapper_owners;
+
+-- Grants for the send* + subscribe/unsubscribe family.
+-- send* are producer-side (insert events) -> pgque_writer.
+-- subscribe/unsubscribe are consumer-side (manage subscription cursor) ->
+-- pgque_reader. See sql/pgque-additions/roles.sql for the producer/consumer
+-- split rationale.
+grant execute on function pgque.send(text, jsonb)               to pgque_writer;
+grant execute on function pgque.send(text, text)                to pgque_writer;
+grant execute on function pgque.send(text, text, jsonb)         to pgque_writer;
+grant execute on function pgque.send(text, text, text)          to pgque_writer;
+grant execute on function pgque.send_batch(text, jsonb[])       to pgque_writer;
+grant execute on function pgque.send_batch(text, text[])        to pgque_writer;
+grant execute on function pgque.send_batch(text, text, jsonb[]) to pgque_writer;
+grant execute on function pgque.send_batch(text, text, text[])  to pgque_writer;
+-- Upgrade path: pre-#163 installs granted subscribe/unsubscribe to
+-- pgque_writer. Revoke explicitly before re-granting on pgque_reader so
+-- in-place upgrades clear the old grants (create or replace function
+-- preserves function-level grants).
+revoke execute on function pgque.subscribe(text, text)         from pgque_writer;
+revoke execute on function pgque.unsubscribe(text, text)       from pgque_writer;
+grant execute on function pgque.subscribe(text, text)           to pgque_reader;
+grant execute on function pgque.unsubscribe(text, text)         to pgque_reader;
+
+-- Internal primitive used by SECURITY DEFINER send_batch wrappers only.
+-- Direct pgque_admin access is intentionally not granted: pgque_admin inherits
+-- pgque_writer, and writers should enter through the audited public send_batch()
+-- wrappers rather than this low-level primitive.
+revoke execute on function pgque.insert_event_bulk(text, text, text[])
+    from public, pgque_reader, pgque_writer, pgque_admin;
+
+-- Re-apply deny-by-default after all API functions are defined.
+-- roles.sql's blanket revoke runs before pgque-api/ files are loaded, so
+-- functions created here would otherwise inherit PostgreSQL's default
+-- PUBLIC EXECUTE. This second pass covers everything.
+revoke execute on all functions in schema pgque from public;
+
+
+
+-- migrate:down

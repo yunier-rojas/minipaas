@@ -1,34 +1,29 @@
 package main
 
 import (
-	"fmt"
-	"strings"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type CodeRouteArgs struct {
 	BaseArgs
-	URL    string `arg:"positional,required" help:"Public URL that will be used to expose the service."`
+	URL    string `arg:"positional,required" help:"Public URL used to expose the service. A path such as /web matches any host and binds plain HTTP on port 80."`
 	Target string `arg:"positional,required" help:"Which service to expose. It can also contain the port. Default port to 80."`
 }
 
 func (args *CodeRouteArgs) Run() {
-	deployProject, composeFile, err := loadProject(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to load build file: %s", composeFile))
-
-	serverFile, err := caddyUpdateConfigAddRoute(args.Env, args.URL, args.Target)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to update caddy config: %s", serverFile))
-	fmt.Println("✅ ", serverFile)
-
-	components := strings.Split(args.Target, ":")
-	container := components[0]
-	port := "80"
-	if len(components) == 2 {
-		port = components[1]
+	rt, err := runtime.NewCodeRouteRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create code route runtime", err)
+		return
 	}
-	err = addComposeResilientDeploy(deployProject, container, port)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to update deployment file: %s", composeFile))
 
-	composeFile, err = saveProject(args.Env, deployProject)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to write file: %s", composeFile))
-	fmt.Println("✅ ", composeFile)
+	routeFile, appsFile, err := rt.UseCase.AddRoute(args.Env, args.URL, args.Target, args.Verbose)
+	if err != nil {
+		logger.PanicErr("Failed to update routing config", err)
+		return
+	}
+
+	logger.Info("Updated routing config: " + routeFile)
+	logger.Info("Updated deploy file: " + appsFile)
 }

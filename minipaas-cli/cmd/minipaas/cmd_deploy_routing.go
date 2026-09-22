@@ -1,7 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type DeployRoutingArgs struct {
@@ -9,25 +10,14 @@ type DeployRoutingArgs struct {
 }
 
 func (args *DeployRoutingArgs) Run() {
-	cfg, configFile, err := loadConfig(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to load configuration file: %s", configFile))
-	setApiEnvVars(args.Env, cfg, args.Verbose)
-
-	serverFile, payload, err := caddyLoadServers(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to load server JSON: %s", serverFile))
-
-	cmdArgs := []string{
-		"/usr/bin/wget",
-		"-O", "-", "-q",
-		"--header=Content-Type: application/json",
-		"--post-data=" + string(payload),
-		"http://127.0.0.1:2019/load",
+	rt, err := runtime.NewDeployRoutingRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create deploy routing runtime", err)
+		return
 	}
 
-	containerID, err := getContainerID(CaddyContainerName)
-	checkErrorPanic(err, fmt.Sprintf("❌ Fail to obtain container ID for `%s`", CaddyContainerName))
-
-	err = dockerContainerExec(containerID, cmdArgs, args.Verbose)
-	checkErrorPanic(err, "❌ Fail to update server in Caddy")
-	fmt.Printf("✅ Routing updated\n")
+	if err = rt.UseCase.Apply(args.Env, args.Verbose); err != nil {
+		logger.PanicErr("Failed to update routing", err)
+		return
+	}
 }

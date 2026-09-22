@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"
-	"path/filepath"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type DeployRolloutArgs struct {
@@ -10,21 +10,14 @@ type DeployRolloutArgs struct {
 }
 
 func (args *DeployRolloutArgs) Run() {
-	cfg, configFile, err := loadConfig(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Error loading configuration file: %s", configFile))
-	setApiEnvVars(args.Env, cfg, args.Verbose)
-
-	composeFiles := cfg.Project.Files
-	composeFiles = append(composeFiles, filepath.Join(args.Env, appsFile))
-
-	var files []string
-	for _, fn := range composeFiles {
-		files = append(files, "-c", fn)
+	rt, err := runtime.NewDeployRolloutRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create deploy rollout runtime", err)
+		return
 	}
 
-	deployArgs := append([]string{"docker", "stack", "deploy"}, files...)
-	deployArgs = append(deployArgs, "minipaas")
-	err = runCommand(deployArgs, args.Verbose)
-	checkErrorPanic(err, fmt.Sprintf("❌ Error deploying version %s", cfg.Deploy.Version))
-	fmt.Printf("✅ Deployment successful: %s\n", cfg.Deploy.Version)
+	if err = rt.UseCase.Rollout(args.Env, args.Verbose); err != nil {
+		logger.PanicErr("Failed to roll out deployment", err)
+		return
+	}
 }

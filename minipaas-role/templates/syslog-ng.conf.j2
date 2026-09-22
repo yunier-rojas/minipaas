@@ -30,14 +30,14 @@ filter f_keywords {
 # Telegram destination
 destination d_telegram {
   telegram(
-    template("⚠ ${PROGRAM}@@${FULLHOST} | ${PRIORITY} ⚠\n---------------------------\n${MSG}")
+    template("${PROGRAM}@@${FULLHOST} | ${PRIORITY}\n---------------------------\n${MSG}")
     throttle(1)
     bot-id("{{ telegram_bot_token }}")
     chat-id("{{ telegram_chat_id }}")
   );
 };
 
-# Logs from minipaas-* containers
+# Logs from containers tagged minipaas-*
 log {
     source(s_docker);
     filter(f_minipaas);

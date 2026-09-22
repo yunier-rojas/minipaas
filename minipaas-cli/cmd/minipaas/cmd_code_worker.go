@@ -1,7 +1,8 @@
 package main
 
 import (
-	"fmt"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/frameworks/logger"
+	"github.com/yunier-rojas/minipaas/minipaas-cli/internal/runtime"
 )
 
 type CodeWorkerArgs struct {
@@ -10,16 +11,17 @@ type CodeWorkerArgs struct {
 }
 
 func (args *CodeWorkerArgs) Run() {
-	deployProject, composeFile, err := loadProject(args.Env)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to load build file: %s", composeFile))
-
-	for _, service := range args.Services {
-		err = addComposeWorkerDeploy(deployProject, service)
-		checkErrorPanic(err, fmt.Sprintf("❌ Failed to update deployment file: %s", composeFile))
+	rt, err := runtime.NewCodeWorkerRuntime()
+	if err != nil {
+		logger.PanicErr("Failed to create code worker runtime", err)
+		return
 	}
 
-	composeFile, err = saveProject(args.Env, deployProject)
-	checkErrorPanic(err, fmt.Sprintf("❌ Failed to write file: %s", composeFile))
-	fmt.Println("✅ ", composeFile)
+	file, err := rt.UseCase.Configure(args.Env, args.Services, args.Verbose)
+	if err != nil {
+		logger.PanicErr("Failed to configure worker", err)
+		return
+	}
 
+	logger.Info("Updated deploy file: " + file)
 }

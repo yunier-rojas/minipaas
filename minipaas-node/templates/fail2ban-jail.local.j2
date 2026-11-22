@@ -1,0 +1,15 @@
+# Managed by Ansible. Do not edit by hand.
+[DEFAULT]
+backend = systemd
+banaction = nftables-multiport
+bantime = {{ node_fail2ban_bantime }}
+findtime = {{ node_fail2ban_findtime }}
+maxretry = {{ node_fail2ban_maxretry }}
+bantime.increment = true
+bantime.maxtime = {{ node_fail2ban_bantime_maxtime }}
+ignoreip = {{ node_fail2ban_ignore_ips | join(' ') }}
+
+[sshd]
+enabled = true
+mode = aggressive
+port = {{ node_ssh_port }}

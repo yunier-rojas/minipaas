@@ -1,0 +1,24 @@
+---
+- name: Reload ssh
+  ansible.builtin.systemd:
+    name: ssh
+    state: reloaded
+  when: not ansible_check_mode
+
+- name: Restart nftables
+  ansible.builtin.systemd:
+    name: nftables
+    state: restarted
+  when: not ansible_check_mode
+
+- name: Restart fail2ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: restarted
+  when: not ansible_check_mode
+
+- name: Restart syslog-ng
+  ansible.builtin.systemd:
+    name: syslog-ng
+    state: restarted
+  when: not ansible_check_mode

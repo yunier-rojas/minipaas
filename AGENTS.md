@@ -2,7 +2,9 @@
 
 ## Project Structure & Module Organization
 - `minipaas-cli/`: Go CLI (entry: `cmd/minipaas/`), with `_test.go` unit tests.
-- `minipaas-role/`: Ansible role (tasks, defaults, templates) for Swarm provisioning.
+- `minipaas-node/`: Ansible role for host hardening, firewall, fail2ban, syslog, and monitoring.
+- `minipaas-swarm/`: Ansible role for Docker installation, Swarm init/join, and swarm-cronjob.
+- `example-provisioning/`: Inventory, playbook, and group vars for the two roles.
 - `docs/`: Hugo site (Hextra theme). Config in `docs/hugo.toml`, content in `docs/content/`.
 - `docs/i18n/`: UI string overrides for the docs site.
 - `example-app/`: Minimal example app and Compose files used by documentation and CLI demos.
@@ -84,9 +86,10 @@ Notably:
 - Prefer table-driven tests.
 - Run via `go test ./...`.
 
-### Role
+### Roles
 - Add reproducible examples in `docs/` when relevant.
-- Add molecule/db tests where feasible in their module directories.
+- Add molecule/db tests where feasible in their role directories.
+- Run `ansible-playbook --syntax-check` against `example-provisioning/` after role changes.
 
 ---
 
@@ -99,7 +102,7 @@ Notably:
 - Index pages (`docs/content/_index.md`, `docs/content/cli/_index.md`, `docs/content/role/_index.md`):
     - **No code blocks**.
     - Must contain a **`## Start Here`** section.
-    - Must reference their source folder (`minipaas-cli/`, `minipaas-role/`).
+    - Must reference their source folders (`minipaas-cli/`, `minipaas-node/`, `minipaas-swarm/`).
     - Keep index pages high-level; details belong in subpages.
 
 ### Tone
@@ -144,7 +147,8 @@ Notably:
 ## Commit & Pull Request Guidelines
 - Use conventional commits with component scopes:
     - `feat(cli): ...`
-    - `fix(role): ...`
+    - `fix(node): ...`
+    - `fix(swarm): ...`
     - `docs: ...`
 - Keep changes focused; avoid mixing refactors with feature work.
 

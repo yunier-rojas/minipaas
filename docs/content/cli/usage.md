@@ -41,7 +41,7 @@ minipaas code init minipaas --registry ghcr.io/org
 
 The command writes `minipaas.yaml`, `compose.apps.yaml`, the base stack files (`compose.common.yml`, `compose.postgres.yml`, `compose.caddy.yml`), and `caddy.json`. It registers the detected files first in `minipaas.yaml`, so all commands deep-merge the local-dev files with the swarm overrides and `deploy build` can reach their `build` sections.
 
-Each service in `compose.apps.yaml` also gets the `alert.cpu_threshold` and `alert.memory_threshold` labels used by the role's monitoring script. Labels already defined in the source Compose files keep their values.
+Each service in `compose.apps.yaml` also gets the `alert.cpu_threshold` and `alert.memory_threshold` labels used by the node role's monitoring script. Labels already defined in the source Compose files keep their values.
 
 Pass `--local=false --host deploy@manager.example.com` to target a remote Swarm manager over SSH; the CLI records `docker.host: ssh://deploy@manager.example.com` in `minipaas.yaml`.
 

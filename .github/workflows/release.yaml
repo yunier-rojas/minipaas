@@ -13,19 +13,22 @@ jobs:
 
   build-role:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        role: [minipaas-node, minipaas-swarm]
     steps:
       - uses: actions/checkout@v6
 
       - name: Build Ansible Role Tarball
         run: |
-          cd minipaas-role
-          tar -czf ../minipaas-role.tar.gz *
+          cd ${{ matrix.role }}
+          tar -czf ../${{ matrix.role }}.tar.gz *
 
       - name: Upload Ansible Role Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: minipaas-role
-          path: minipaas-role.tar.gz
+          name: ${{ matrix.role }}
+          path: ${{ matrix.role }}.tar.gz
 
   build-cli:
     runs-on: ubuntu-latest
@@ -104,18 +107,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download CLI artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./release-artifacts
           pattern: minipaas-*
           merge-multiple: true
-
-      - name: Download Ansible Role Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: minipaas-role
-          path: ./release-artifacts
 
       - name: Release on GitHub
         uses: softprops/action-gh-release@v2

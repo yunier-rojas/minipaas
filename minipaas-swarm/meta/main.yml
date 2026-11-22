@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  role_name: minipaas-swarm
+  namespace: yunier_rojas
+  author: "Yunier Rojas"
+  description: "Ansible role to install Docker and form a Docker Swarm cluster"
+  license: "MIT"
+  min_ansible_version: "2.9"
+  galaxy_tags:
+    - docker
+    - swarm
+    - paas
+dependencies: []
+collections:
+  - community.docker

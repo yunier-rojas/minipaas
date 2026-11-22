@@ -1,45 +1,51 @@
 ---
+- name: Require a managers group
+  ansible.builtin.assert:
+    that:
+      - groups['managers'] | default([]) | length > 0
+    fail_msg: Define at least one host in the managers group.
+    quiet: true
+  tags: [swarm]
+
 - name: Set main manager flag
   ansible.builtin.set_fact:
-    is_main_manager: "{{ inventory_hostname == groups['managers'][0] }}"
+    is_main_manager: "{{ inventory_hostname == (groups['managers'] | first) }}"
+  tags: [swarm]
 
 - name: Set manager role flag
   ansible.builtin.set_fact:
     is_manager: "{{ inventory_hostname in groups['managers'] }}"
+  tags: [swarm]
 
 - name: Set worker role flag
   ansible.builtin.set_fact:
-    is_worker: "{{ inventory_hostname in groups['workers'] }}"
-
-- name: Configure Telegram notifications
-  ansible.builtin.set_fact:
-    use_telegram: "{{ telegram_chat_id and telegram_bot_token }}"
+    is_worker: "{{ inventory_hostname in groups['workers'] | default([]) }}"
+  tags: [swarm]
 
 - name: Install system packages
   ansible.builtin.import_tasks: install.yml
-
-- name: Configure firewall
-  ansible.builtin.import_tasks: firewall.yml
-
-- name: Setup fail2ban
-  ansible.builtin.import_tasks: fail2ban.yml
-
-- name: Configure monitoring
-  ansible.builtin.import_tasks: monitoring.yml
-
-- name: Setup syslog
-  ansible.builtin.import_tasks: syslog-ng.yml
+  tags: [swarm, docker]
 
 - name: Configure Docker daemon
   ansible.builtin.import_tasks: docker_conf.yml
+  tags: [swarm, docker]
+
 - name: Install Docker
   ansible.builtin.import_tasks: docker.yml
+  tags: [swarm, docker]
+
 - name: Setup Swarm managers
   ansible.builtin.import_tasks: swarm_managers.yml
+  tags: [swarm]
+
 - name: Setup Swarm workers
   ansible.builtin.import_tasks: swarm_workers.yml
+  tags: [swarm]
 
 - name: Configure cron jobs
   ansible.builtin.import_tasks: cronjob.yml
+  tags: [swarm]
+
 - name: Disable unused cron jobs
   ansible.builtin.import_tasks: cronjob_disable.yml
+  tags: [swarm]

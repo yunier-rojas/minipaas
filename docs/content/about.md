@@ -25,7 +25,8 @@ The gap is especially visible for small teams who want infrastructure that is:
 MiniPaaS provides a small set of open components that layer onto Docker Swarm:
 
 - **CLI** (`minipaas-cli/`): Builds images, rolls out the stack, and manages Swarm secrets, configs, and Caddy routing from Compose files.
-- **Ansible Role** (`minipaas-role/`): Turns plain Linux hosts into secure Swarm nodes with firewalling, monitoring, syslog, and swarm-cronjob.
+- **Node role** (`minipaas-node/`): Hardens Linux hosts with SSH, firewalling, monitoring, syslog, and Fail2Ban.
+- **Swarm role** (`minipaas-swarm/`): Installs Docker, creates the cluster, and runs swarm-cronjob.
 
 Each component is standalone. You can adopt one or both.
 
@@ -47,5 +48,5 @@ MiniPaaS aims to reduce infrastructure friction while keeping everything transpa
 
 ## Learn More
 
-- Infrastructure: [Ansible Role](/role/)
+- Infrastructure: [Ansible Roles](/role/)
 - Deployments: [CLI Overview](/cli/)  

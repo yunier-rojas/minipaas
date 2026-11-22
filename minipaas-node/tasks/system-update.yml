@@ -1,0 +1,19 @@
+---
+- name: Refresh the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 0
+
+- name: Upgrade installed packages
+  ansible.builtin.apt:
+    upgrade: dist
+
+- name: Check for a pending reboot
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: node_reboot
+
+- name: Report a pending reboot
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} needs a reboot"
+  when: node_reboot.stat.exists

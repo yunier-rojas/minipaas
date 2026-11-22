@@ -46,7 +46,7 @@ disableKinds = ["taxonomy", "term"]
   weight = 1
 
 [[menu.main]]
-  name = "Role"
+  name = "Roles"
   pageRef = "/role"
   weight = 2
 

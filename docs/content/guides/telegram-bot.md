@@ -6,21 +6,21 @@ weight: 7
 
 ## Overview
 
-The MiniPaaS role sends monitoring reports and log alerts to Telegram. It needs two values:
+The MiniPaaS node role sends monitoring reports and log alerts to Telegram. It needs two values:
 
 - `telegram_bot_token`: the HTTP API token of the bot that posts alerts
 - `telegram_chat_id`: the channel or group that receives them
 
-When both are set, the role installs the monitoring script and writes `/etc/telegram.secrets` with `BOT_TOKEN` and `GROUP_ID`. See **[Monitoring](/role/monitoring/)**.
+When both are set, the node role installs the monitoring script and writes `/etc/telegram.secrets` with `BOT_TOKEN` and `GROUP_ID`. See **[Monitoring](/role/monitoring/)**.
 
-This guide covers creating the bot, creating the channel, and giving the role its credentials.
+This guide covers creating the bot, creating the channel, and giving the node role its credentials.
 
 ---
 
 ## Prerequisites
 
 - A Telegram account
-- MiniPaaS installed with the role; see **[Role Installation](/role/installation/)**
+- MiniPaaS installed with the node role; see **[Role Installation](/role/installation/)**
 
 ---
 
@@ -67,13 +67,13 @@ telegram_chat_id: "-1001234567890"
 
 The variables default to the `TELEGRAM_TOKEN` and `TELEGRAM_CHAT` environment variables. Store the token in Ansible Vault rather than plain text. See **[Configuration](/role/configuration/)**.
 
-The role activates Telegram when both values are set. Re-run the playbook to install the monitoring script and write `/etc/telegram.secrets`.
+The node role activates Telegram when both values are set. Re-run the playbook to install the monitoring script and write `/etc/telegram.secrets`.
 
 ---
 
 ## 5. Verify
 
-The role installs `/usr/local/bin/system-monitoring.sh` and starts it at boot through `/etc/cron.d/monitoring-telegram`. The script sends a boot report. Watch the channel for the message.
+The node role installs `/usr/local/bin/system-monitoring.sh` and starts it at boot through `/etc/cron.d/monitoring-telegram`. The script sends a boot report. Watch the channel for the message.
 
 Check the secrets file on a node:
 
@@ -88,7 +88,7 @@ The file is owned by `root:root` with mode `0600`.
 ## Notes
 
 - A bot posts to a channel only when the channel grants it permission.
-- The role reads the chat ID as `telegram_chat_id` and writes it as `GROUP_ID`.
+- The node role reads the chat ID as `telegram_chat_id` and writes it as `GROUP_ID`.
 - Change the token in BotFather at any time. Update `telegram_bot_token` and re-run the playbook.
 - The monitoring script also forwards container errors. See **[Monitoring](/role/monitoring/)**.
 

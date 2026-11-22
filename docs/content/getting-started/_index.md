@@ -6,12 +6,13 @@ weight: 1
 
 ## Overview
 
-MiniPaaS combines two independent components:
+MiniPaaS combines three components:
 
-- **`minipaas-role/`** prepares Linux hosts and creates a Docker Swarm cluster.
+- **`minipaas-node/`** hardens Linux hosts and configures firewall, logging, and monitoring.
+- **`minipaas-swarm/`** installs Docker and creates a Docker Swarm cluster.
 - **`minipaas-cli/`** builds images, rolls out the stack, and manages Swarm secrets, configs, and Caddy routing.
 
-You can adopt either component on its own. The quickstart uses both to take fresh servers from provisioning to a service reachable through Caddy.
+You can adopt the node role on its own. The quickstart uses all three to take fresh servers from provisioning to a service reachable through Caddy.
 
 ## Start Here
 

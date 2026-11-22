@@ -6,7 +6,7 @@ weight: 1
 
 ## Overview
 
-Reference pages list configuration values and generated artifacts for `minipaas-cli/` and `minipaas-role/` without task walkthroughs.
+Reference pages list configuration values and generated artifacts for `minipaas-cli/`, `minipaas-node/`, and `minipaas-swarm/` without task walkthroughs.
 
 ## Start Here
 

@@ -8,7 +8,7 @@ weight: 2
 
 This walkthrough goes from fresh Linux hosts to a running service reachable through Caddy:
 
-1. Provision the cluster with the Ansible role.
+1. Provision the cluster with the Ansible roles.
 2. Install the CLI.
 3. Scaffold an environment.
 4. Create a database secret.
@@ -26,11 +26,11 @@ On your workstation, clone the repository and install the role dependencies:
 ```bash
 git clone https://github.com/yunier-rojas/minipaas.git
 cd minipaas
-ansible-galaxy install -r minipaas-role/requirements.yml
+ansible-galaxy install -r minipaas-swarm/requirements.yml
 ansible-galaxy role install geerlingguy.docker
 ```
 
-Create `inventory.ini` and `playbook.yml`:
+Create `inventory.ini`, `playbook.yml`, and the group variables:
 
 ```ini
 [managers]
@@ -41,18 +41,36 @@ worker1 ansible_host=1.2.3.5
 ```
 
 ```yaml
-- name: Install and Configure MiniPaaS
+- name: Provision MiniPaaS
   hosts: all
   become: true
   roles:
-    - ./minipaas-role
+    - role: ./minipaas-node
+      tags: [node]
+    - role: ./minipaas-swarm
+      tags: [swarm]
+```
+
+```yaml
+# group_vars/managers.yml
+node_firewall_tcp_ports: [2377, 7946, 80, 443]
+node_firewall_udp_ports: [7946, 4789]
+```
+
+```yaml
+# group_vars/workers.yml
+node_firewall_tcp_ports: [7946]
+node_firewall_udp_ports: [7946, 4789]
 ```
 
 Run the playbook:
 
 ```bash
+ansible-playbook -i inventory.ini playbook.yml --check --tags node
 ansible-playbook -i inventory.ini playbook.yml
 ```
+
+The node role hardens SSH by default. Confirm that key-based access works before the real run.
 
 See **[Role Installation](/role/installation/)** for requirements and verification steps.
 

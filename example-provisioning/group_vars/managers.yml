@@ -1,0 +1,9 @@
+---
+node_firewall_tcp_ports:
+  - 2377
+  - 7946
+  - 80
+  - 443
+node_firewall_udp_ports:
+  - 7946
+  - 4789

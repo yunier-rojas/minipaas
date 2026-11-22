@@ -1,12 +1,12 @@
 ---
 title: Alert Labels
-description: Per-container thresholds read by the role's monitoring script.
+description: Per-container thresholds read by the node role's monitoring script.
 weight: 3
 ---
 
 ## Overview
 
-The monitoring script installed by `minipaas-role/` checks every running container when `--DOCKER-MONITOR` is active. Two labels tune the thresholds.
+The monitoring script installed by `minipaas-node/` checks every running container when `--DOCKER-MONITOR` is active. Two labels tune the thresholds.
 
 | Label | Meaning | Default |
 | --- | --- | --- |

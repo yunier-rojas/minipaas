@@ -3,13 +3,10 @@
   ansible.builtin.service:
     name: docker
     state: restarted
-
-- name: Restart Fail2Ban
-  ansible.builtin.service:
-    name: fail2ban
-    state: restarted
+  when: not ansible_check_mode
 
 - name: Restart Swarm-Cronjob
   ansible.builtin.service:
     name: swarm-cronjob
     state: restarted
+  when: not ansible_check_mode

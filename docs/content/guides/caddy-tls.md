@@ -31,7 +31,7 @@ minipaas deploy routing dev
 
 `code init` writes `compose.caddy.yml`, which runs `caddy:2.9.1-alpine` on a manager node, mounts the `caddy_data` and `caddy_config` volumes, and publishes container port `80` on host port `8000`.
 
-For hostname routes that terminate TLS, publish container port `443` as well. The role's firewall opens HTTP and HTTPS on managers by default; see **[Firewall](/role/firewall/)**.
+For hostname routes that terminate TLS, publish container port `443` as well. Add HTTP and HTTPS to `node_firewall_tcp_ports` for the manager group; see **[Firewall](/role/firewall/)**.
 
 ---
 
@@ -46,5 +46,5 @@ For hostname routes that terminate TLS, publish container port `443` as well. Th
 ## Next Steps
 
 - **[Commands](/cli/commands/)**: full command reference.
-- **[Firewall](/role/firewall/)**: ports opened by the role.
+- **[Firewall](/role/firewall/)**: ports opened by the node role.
 - **[Base Stack Files](/reference/base-stack/)**: what `code init` writes.

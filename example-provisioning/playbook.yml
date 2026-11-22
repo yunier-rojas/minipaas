@@ -1,0 +1,9 @@
+---
+- name: Provision MiniPaaS nodes
+  hosts: all
+  become: true
+  roles:
+    - role: ../minipaas-node
+      tags: [node]
+    - role: ../minipaas-swarm
+      tags: [swarm]

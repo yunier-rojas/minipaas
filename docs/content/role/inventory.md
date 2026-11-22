@@ -1,13 +1,13 @@
 ---
 title: Inventory
-description: How to structure the Ansible inventory for provisioning MiniPaaS servers.
+description: How to structure the Ansible inventory for MiniPaaS hosts.
 weight: 5
 ---
 
 ## Overview
 
-The MiniPaaS Ansible role (`minipaas-role/`) uses a simple inventory layout.  
-Hosts are grouped as **managers** or **workers**. Variables configure extra firewall ports, Telegram alerts, and the `swarm-cronjob` release; see **[Variables](/role/variables/)**.
+The MiniPaaS roles use a simple inventory layout.  
+Hosts are grouped as **managers** or **workers**. Variables configure SSH, firewall ports, Telegram alerts, and the `swarm-cronjob` release; see **[Variables](/role/variables/)**.
 
 This keeps the provisioning layer small, predictable, and easy to maintain.
 
@@ -25,7 +25,7 @@ manager1 ansible_host=1.2.3.4
 worker1 ansible_host=1.2.3.5
 ```
 
-The role installs Docker, configures the system, and performs `swarm init` or `swarm join` depending on the group.
+The node role hardens each host. The swarm role performs `swarm init` or `swarm join` depending on the group.
 
 ---
 
@@ -37,15 +37,24 @@ Examples:
 ### `group_vars/managers.yml`
 
 ```yaml
-minipaas_extra_ports:
-  - 8080
+node_firewall_tcp_ports:
+  - 2377
+  - 7946
+  - 80
+  - 443
+node_firewall_udp_ports:
+  - 7946
+  - 4789
 ```
 
 ### `group_vars/workers.yml`
 
 ```yaml
-minipaas_extra_ports:
-  - 3000
+node_firewall_tcp_ports:
+  - 7946
+node_firewall_udp_ports:
+  - 7946
+  - 4789
 ```
 
 ---
@@ -59,6 +68,14 @@ Example: enabling Telegram alerts on a specific node:
 ```yaml
 telegram_bot_token: "123:ABC"
 telegram_chat_id: "999111222"
+```
+
+Example: restricting SSH to your office network:
+
+```yaml
+node_ssh_restrict: true
+node_ssh_allowed_cidrs:
+  - 203.0.113.10/32
 ```
 
 ---
@@ -75,7 +92,7 @@ manager1 ansible_host=1.2.3.4
 worker1 ansible_host=1.2.3.5 ansible_user=deploy
 ```
 
-Use `group_vars/` or `host_vars/` for list values such as `minipaas_extra_ports`.
+Use `group_vars/` or `host_vars/` for list values such as `node_firewall_tcp_ports`.
 
 Inline variables override defaults and group vars.
 
@@ -103,7 +120,8 @@ Your inventory defines:
 
 * which hosts are managers
 * which hosts are workers
-* optional firewall ports
-* optional monitoring/alerting configuration
+* firewall ports
+* optional SSH restrictions
+* optional monitoring and alerting configuration
 
 All other provisioning behavior is automatic and requires no additional settings.

@@ -5,7 +5,9 @@ on:
   push:
     paths:
       - 'minipaas-cli/**'
-      - 'minipaas-role/**'
+      - 'minipaas-node/**'
+      - 'minipaas-swarm/**'
+      - 'example-provisioning/**'
       - 'docs/**'
       - 'mk/**'
       - 'Makefile'
@@ -58,6 +60,29 @@ jobs:
       - name: Run Go tests
         run: make test
         working-directory: minipaas-cli
+
+  roles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Ansible
+        run: pip install ansible-core
+
+      - name: Install role dependencies
+        run: |
+          ansible-galaxy install -r minipaas-swarm/requirements.yml
+          ansible-galaxy role install geerlingguy.docker
+
+      - name: Check playbook syntax
+        run: |
+          ansible-playbook -i example-provisioning/inventory.ini example-provisioning/playbook.yml --syntax-check
+          ansible-playbook -i example-provisioning/inventory.ini example-provisioning/update.yml --syntax-check
 
   docs:
     runs-on: ubuntu-latest

@@ -6,16 +6,21 @@ weight: 5
 
 ## Overview
 
-The two components have separate requirements. This page summarizes what each one targets.
+The components have separate requirements. This page summarizes what each one targets.
 
 ---
 
-## Role
+## Roles
 
 - Linux hosts with SSH access and systemd
 - Debian and Ubuntu families
 - Python 3 and Ansible on the control machine
-- Ansible collection `community.docker` and the `geerlingguy.docker` role
+- Key-based SSH access before `minipaas-node` hardens SSH
+
+`minipaas-swarm` also needs:
+
+- Ansible collection `community.docker`
+- The `geerlingguy.docker` role
 
 ---
 
@@ -31,13 +36,13 @@ The two components have separate requirements. This page summarizes what each on
 ## Cluster
 
 - A Docker Swarm cluster; the CLI works with any reachable Docker endpoint
-- `swarm-cronjob` for cron-triggered services, installed by the role (default `1.14.0`)
+- `swarm-cronjob` for cron-triggered services, installed by `minipaas-swarm` (default `1.14.0`)
 
 ---
 
 ## Notes
 
-- The role targets a single manager; each host in `managers` initializes its own cluster. Add capacity with workers.
+- The roles target a single manager; each host in `managers` initializes its own cluster. Add capacity with workers.
 - The CLI manages application artifacts and does not provision hosts.
 
 ---

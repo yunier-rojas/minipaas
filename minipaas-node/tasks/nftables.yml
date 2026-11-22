@@ -1,20 +1,25 @@
-- name: Ensure nftables is installed and enabled
+---
+- name: Install nftables
   ansible.builtin.apt:
     name: nftables
     state: present
     update_cache: true
 
-
-- name: Generate nftables configuration file
+- name: Write nftables ruleset
   ansible.builtin.template:
     src: nftables.conf.j2
     dest: /etc/nftables.conf
     owner: root
     group: root
-    mode: '0644'
+    mode: "0644"
+  notify: Restart nftables
 
-- name: Enable and start nftables
+- name: Enable nftables
   ansible.builtin.systemd:
     name: nftables
     enabled: true
     state: started
+  when: not ansible_check_mode
+
+- name: Apply the nftables ruleset
+  ansible.builtin.meta: flush_handlers

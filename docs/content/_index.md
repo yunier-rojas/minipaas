@@ -10,7 +10,8 @@ cascade:
 MiniPaaS is a collection of small, focused tools for simple and repeatable service deployments.  
 Each component is independent and can be adopted incrementally:
 
-- **`minipaas-role/`** provisions servers and prepares them to run a Docker Swarm cluster.  
+- **`minipaas-node/`** hardens Linux hosts and configures firewall, logging, and monitoring.  
+- **`minipaas-swarm/`** installs Docker and creates a Docker Swarm cluster.  
 - **`minipaas-cli/`** builds images, rolls out the stack, and manages Swarm secrets, configs, and Caddy routing.  
 
 The project targets side projects, small clusters, and teams that value explicit control over their infrastructure.
@@ -21,10 +22,11 @@ The project targets side projects, small clusters, and teams that value explicit
 
 MiniPaaS follows a clear separation of concerns:
 
-- The **role** prepares machines: Docker, Swarm initialization, firewall, and monitoring.  
+- The **node role** hardens machines: SSH, firewall, syslog, Fail2Ban, and monitoring.  
+- The **swarm role** installs Docker and creates the Swarm cluster.  
 - The **CLI** builds images, rolls out the stack, and manages secrets, configs, and Caddy routing.  
 
-The role changes rarely; the CLI evolves on its own.
+The roles change rarely; the CLI evolves on its own.
 
 ---
 
@@ -43,8 +45,8 @@ MiniPaaS is built for developers who prefer **small, predictable, scriptable com
 
 ## Components
 
-### Provisioning: `minipaas-role/`
-An Ansible role that prepares servers for Docker Swarm with secure defaults, logging, firewall rules, and host-level cron orchestration.
+### Provisioning: `minipaas-node/` and `minipaas-swarm/`
+Two Ansible roles that harden hosts and prepare them for Docker Swarm with secure defaults, logging, firewall rules, and host-level cron orchestration.
 
 ### Deployment: `minipaas-cli/`
 A command-line interface for building images, rolling out the stack, and managing secrets, configs, and Caddy routing across Compose files.
@@ -54,7 +56,7 @@ A command-line interface for building images, rolling out the stack, and managin
 ## Start Here
 
 - Deploy your first application → **[Quickstart](/getting-started/quickstart/)**
-- Server provisioning → **[Role Overview](/role/)**
+- Server provisioning → **[Roles Overview](/role/)**
 - Deploying applications → **[CLI Overview](/cli/)**
 - Workflow walkthroughs → **[Guides](/guides/)**
 

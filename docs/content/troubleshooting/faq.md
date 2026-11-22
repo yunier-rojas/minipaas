@@ -6,7 +6,7 @@ weight: 3
 
 ## Do I need both components?
 
-No. `minipaas-role/` and `minipaas-cli/` are independent. Use the role to prepare hosts and the CLI to deploy; either can be adopted alone. See **[MiniPaaS Overview](/)**.
+No. `minipaas-node/`, `minipaas-swarm/`, and `minipaas-cli/` are independent. Use the roles to prepare hosts and the CLI to deploy; any component can be adopted alone. See **[MiniPaaS Overview](/)**.
 
 ## Can I use an existing Swarm cluster?
 
@@ -20,13 +20,13 @@ In files: `minipaas.yaml`, the Compose files, and `caddy.json` inside the enviro
 
 Yes. Give each environment a distinct `namespace` so stacks, services, and networks do not collide. See **[Multiple Environments](/guides/multiple-environments/)**.
 
-## Does the role support multiple managers?
+## Do the roles support multiple managers?
 
 Keep one host in the `managers` group; every host in that group initializes its own cluster. Scale with workers. See **[Role Usage](/role/usage/)**.
 
-## How do I remove the role?
+## How do I remove the roles?
 
-Stop and disable the systemd units, uninstall the packages, and remove the task from `minipaas-role/tasks/main.yml`. See **[Role Usage](/role/usage/)**.
+Stop and disable the systemd units, uninstall the packages, and remove the task from the matching role's `tasks/main.yml` in `minipaas-node/` or `minipaas-swarm/`. See **[Role Usage](/role/usage/)**.
 
 ## Which registry can I use?
 
@@ -34,4 +34,4 @@ Any registry reachable from the build machine and the cluster. `code init --regi
 
 ## Does the CLI support Windows?
 
-Prebuilt binaries exist for windows-amd64. The role targets Debian and Ubuntu hosts. See **[Compatibility](/reference/compatibility/)**.
+Prebuilt binaries exist for windows-amd64. The roles target Debian and Ubuntu hosts. See **[Compatibility](/reference/compatibility/)**.

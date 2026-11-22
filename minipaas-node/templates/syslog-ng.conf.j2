@@ -1,0 +1,69 @@
+@version: current
+@include "scl.conf"
+
+source s_local {
+    system();
+};
+
+source s_internal {
+    internal();
+};
+
+source s_docker {
+    udp(ip("127.0.0.1") port(514));
+};
+
+filter f_alerts {
+    (level(err..emerg) and not program("^sshd"))
+    or message('"level":"error"')
+    or message('"level":"fatal"')
+    or (program("^fail2ban") and message(" Ban "))
+    or (program("^sshd") and message("Accepted "))
+};
+
+filter f_container_alerts {
+    program("minipaas-.*")
+    and (
+        level(err..emerg)
+        or message("ERROR")
+        or message("CRITICAL")
+        or message("FATAL")
+        or message("PANIC")
+    );
+};
+
+destination d_internal {
+    file("/var/log/syslog-ng.log");
+};
+
+{% if node_use_telegram | bool %}
+destination d_telegram {
+    telegram(
+        template("${PROGRAM}@@${FULLHOST} | ${PRIORITY}\n---------------------------\n${MSG}")
+        parse-mode("none")
+        throttle(1)
+        max-size(3500)
+        bot-id("{{ telegram_bot_token }}")
+        chat-id("{{ telegram_chat_id }}")
+    );
+};
+{% endif %}
+
+log {
+    source(s_internal);
+    destination(d_internal);
+};
+
+{% if node_use_telegram | bool %}
+log {
+    source(s_local);
+    filter(f_alerts);
+    destination(d_telegram);
+};
+
+log {
+    source(s_docker);
+    filter(f_container_alerts);
+    destination(d_telegram);
+};
+{% endif %}

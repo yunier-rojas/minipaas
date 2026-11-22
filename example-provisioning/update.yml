@@ -1,0 +1,7 @@
+---
+- name: Update MiniPaaS nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Update the system
+      ansible.builtin.import_tasks: ../minipaas-node/tasks/system-update.yml

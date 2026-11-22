@@ -1,0 +1,35 @@
+table inet filter {
+  chain input {
+    type filter hook input priority 0;
+    policy drop;
+
+    ct state established,related accept
+    iif "lo" accept
+
+{% if node_ssh_restrict | bool %}
+    ip saddr { {{ node_ssh_allowed_cidrs | join(', ') }} } tcp dport {{ node_ssh_port }} accept
+{% else %}
+    tcp dport {{ node_ssh_port }} accept
+{% endif %}
+
+{% for port in node_firewall_tcp_ports %}
+    tcp dport {{ port }} accept
+{% endfor %}
+{% for port in node_firewall_udp_ports %}
+    udp dport {{ port }} accept
+{% endfor %}
+
+    ip saddr 127.0.0.1 udp dport 514 accept
+    udp dport 514 drop
+  }
+
+  chain forward {
+    type filter hook forward priority 0;
+    policy accept;
+  }
+
+  chain output {
+    type filter hook output priority 0;
+    policy accept;
+  }
+}

@@ -24,4 +24,4 @@ Typical topics include:
 To learn how to use MiniPaaS:
 
 - CLI: [CLI Overview](/cli/)
-- Role: [Ansible Role Overview](/role/)  
+- Roles: [Ansible Roles Overview](/role/)  

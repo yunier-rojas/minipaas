@@ -1,0 +1,93 @@
+---
+- name: Install syslog-ng
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - syslog-ng-core
+      - syslog-ng-scl
+      - syslog-ng-mod-http
+    state: present
+    update_cache: true
+
+- name: Write the syslog-ng configuration candidate
+  ansible.builtin.template:
+    src: syslog-ng.conf.j2
+    dest: /etc/syslog-ng/syslog-ng.conf.new
+    owner: root
+    group: root
+    mode: "0640"
+  no_log: true
+
+- name: Validate the syslog-ng configuration
+  block:
+    - name: Check the syslog-ng configuration
+      ansible.builtin.command:
+        cmd: syslog-ng --syntax-only -f /etc/syslog-ng/syslog-ng.conf.new
+      changed_when: false
+      no_log: true
+  rescue:
+    - name: Report the syslog-ng validation failure
+      ansible.builtin.fail:
+        msg: >-
+          syslog-ng rejected /etc/syslog-ng/syslog-ng.conf.new, so the live
+          configuration was not changed. Run
+          `sudo syslog-ng --syntax-only -f /etc/syslog-ng/syslog-ng.conf.new`
+          on the host to see the error. Ansible hides the output because the
+          file may contain the bot token.
+  when: not ansible_check_mode
+
+- name: Activate the syslog-ng configuration
+  ansible.builtin.copy:
+    src: /etc/syslog-ng/syslog-ng.conf.new
+    dest: /etc/syslog-ng/syslog-ng.conf
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0640"
+  no_log: true
+  notify: Restart syslog-ng
+  register: node_syslog_ng_config
+
+- name: Ensure the syslog-ng runtime directory
+  ansible.builtin.file:
+    path: /run/syslog-ng
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Apply the syslog-ng configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable syslog-ng
+  ansible.builtin.systemd:
+    name: syslog-ng
+    enabled: true
+    state: started
+  register: node_syslog_ng_service
+  when: not ansible_check_mode
+
+- name: Require syslog-ng to be active
+  ansible.builtin.assert:
+    that:
+      - node_syslog_ng_service.status.ActiveState | default('') == 'active'
+    fail_msg: syslog-ng is not active. Check `journalctl -u syslog-ng`.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Send a test alert
+  ansible.builtin.uri:
+    url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      chat_id: "{{ telegram_chat_id }}"
+      text: "MiniPaaS: alerting works on {{ inventory_hostname }}"
+    status_code: 200
+  changed_when: false
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - node_use_telegram | bool
+    - node_syslog_ng_config is defined
+    - node_syslog_ng_config is changed

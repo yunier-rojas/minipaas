@@ -1,0 +1,10 @@
+# Managed by Ansible. Do not edit by hand.
+PubkeyAuthentication yes
+PasswordAuthentication {{ 'yes' if node_ssh_password_authentication | bool else 'no' }}
+KbdInteractiveAuthentication {{ 'yes' if node_ssh_password_authentication | bool else 'no' }}
+PermitEmptyPasswords no
+PermitRootLogin {{ node_ssh_permit_root_login }}
+MaxAuthTries {{ node_ssh_max_auth_tries }}
+LoginGraceTime {{ node_ssh_login_grace_time }}
+ClientAliveInterval {{ node_ssh_client_alive_interval }}
+ClientAliveCountMax {{ node_ssh_client_alive_count_max }}

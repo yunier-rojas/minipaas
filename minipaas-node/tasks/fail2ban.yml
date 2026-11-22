@@ -1,0 +1,59 @@
+---
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+    update_cache: true
+  notify: Restart fail2ban
+
+- name: Send fail2ban events to syslog
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/fail2ban.d/10-syslog.conf
+    content: |
+      [Definition]
+      logtarget = SYSLOG
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: Write the fail2ban jail
+  ansible.builtin.template:
+    src: fail2ban-jail.local.j2
+    dest: /etc/fail2ban/jail.d/zz-minipaas.local
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: Enable fail2ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Apply the fail2ban configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the sshd jail status
+  ansible.builtin.command:
+    cmd: fail2ban-client status sshd
+  register: node_fail2ban_sshd
+  changed_when: false
+  failed_when: false
+  until: node_fail2ban_sshd.rc == 0
+  retries: 10
+  delay: 1
+  when: not ansible_check_mode
+
+- name: Require the sshd jail
+  ansible.builtin.assert:
+    that:
+      - node_fail2ban_sshd.rc == 0
+      - "'Status for the jail: sshd' in node_fail2ban_sshd.stdout"
+    fail_msg: >-
+      fail2ban did not start the sshd jail. Run `sudo fail2ban-client status sshd`
+      and `sudo journalctl -u fail2ban` on the host.
+    quiet: true
+  when: not ansible_check_mode

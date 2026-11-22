@@ -1,0 +1,31 @@
+---
+telegram_bot_token: "{{ lookup('env', 'TELEGRAM_TOKEN') }}"
+telegram_chat_id: "{{ lookup('env', 'TELEGRAM_CHAT') }}"
+node_require_telegram_alerts: false
+
+node_ssh_harden: true
+node_ssh_port: 22
+node_ssh_password_authentication: false
+node_ssh_permit_root_login: prohibit-password
+node_ssh_max_auth_tries: 3
+node_ssh_login_grace_time: 20
+node_ssh_client_alive_interval: 300
+node_ssh_client_alive_count_max: 2
+node_ssh_restrict: false
+node_ssh_allowed_cidrs: []
+
+node_firewall_tcp_ports: []
+node_firewall_udp_ports: []
+
+node_fail2ban_bantime: 1h
+node_fail2ban_findtime: 10m
+node_fail2ban_maxretry: 4
+node_fail2ban_bantime_maxtime: 4w
+node_fail2ban_ignore_ips:
+  - 127.0.0.1/8
+  - "::1"
+
+node_monitoring_script_url: >-
+  {{ 'https://raw.githubusercontent.com/yunier-rojas/telegram-bash-system-monitoring/' ~
+  '9d35b96541afc808e24e5fd0aff8a72bff4de114/system-monitoring.sh' }}
+node_monitoring_flags: "--CPU 80 --RAM 70 --DISK 90 --LA1 --LA5 --LA15 --REBOOT --SSH-LOGIN --DOCKER-MONITOR"

@@ -1,0 +1,69 @@
+---
+- name: Ensure the sshd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check that sshd reads the drop-in directory
+  ansible.builtin.command:
+    cmd: grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  register: node_sshd_include
+
+- name: Require the sshd include
+  ansible.builtin.assert:
+    that:
+      - node_sshd_include.rc == 0
+    fail_msg: >-
+      /etc/ssh/sshd_config does not include /etc/ssh/sshd_config.d/*.conf.
+      Add the Include line before hardening SSH.
+    quiet: true
+
+- name: Write the SSH hardening drop-in
+  ansible.builtin.template:
+    src: sshd-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-minipaas-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Reload ssh
+
+- name: Read the effective sshd configuration
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -T
+  changed_when: false
+  check_mode: false
+  register: node_sshd_effective
+
+- name: Require key-only authentication
+  ansible.builtin.assert:
+    that:
+      - node_sshd_effective.stdout is search('(?m)^passwordauthentication no$')
+      - node_sshd_effective.stdout is search('(?m)^kbdinteractiveauthentication no$')
+      - node_sshd_effective.stdout is search('(?m)^pubkeyauthentication yes$')
+    fail_msg: >-
+      sshd did not apply the MiniPaaS hardening. Another drop-in may override
+      99-minipaas-hardening.conf. Run `sudo sshd -T` on the host to inspect the
+      effective values.
+    quiet: true
+  when:
+    - not ansible_check_mode
+    - not node_ssh_password_authentication | bool
+
+- name: Require root password login to be off
+  ansible.builtin.assert:
+    that:
+      - node_sshd_effective.stdout is not search('(?m)^permitrootlogin yes$')
+    fail_msg: >-
+      sshd still allows password login for root. Run `sudo sshd -T` on the host
+      to find the drop-in that overrides 99-minipaas-hardening.conf.
+    quiet: true
+  when:
+    - not ansible_check_mode
+    - node_ssh_permit_root_login != 'yes'

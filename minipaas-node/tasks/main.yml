@@ -1,0 +1,49 @@
+---
+- name: Detect alert configuration
+  ansible.builtin.set_fact:
+    node_use_telegram: "{{ telegram_bot_token | default('') | length > 0 and telegram_chat_id | default('') | length > 0 }}"
+  tags: always
+
+- name: Require Telegram alerting
+  ansible.builtin.assert:
+    that:
+      - node_use_telegram | bool
+    fail_msg: >-
+      Telegram alerting is not configured. Set telegram_bot_token and
+      telegram_chat_id, or set node_require_telegram_alerts to false.
+    quiet: true
+  when: node_require_telegram_alerts | bool
+  tags: [provision, node]
+
+- name: Require an IPv4 SSH allowlist when SSH is restricted
+  ansible.builtin.assert:
+    that:
+      - node_ssh_allowed_cidrs | length > 0
+      - node_ssh_allowed_cidrs | select('search', ':') | list | length == 0
+    fail_msg: >-
+      node_ssh_restrict is true but node_ssh_allowed_cidrs is empty or contains
+      an IPv6 range. Add the IPv4 ranges that may reach SSH.
+    quiet: true
+  when: node_ssh_restrict | bool
+  tags: [provision, node]
+
+- name: Harden SSH
+  ansible.builtin.import_tasks: ssh.yml
+  when: node_ssh_harden | bool
+  tags: [provision, node]
+
+- name: Configure firewall
+  ansible.builtin.import_tasks: nftables.yml
+  tags: [provision, node]
+
+- name: Configure fail2ban
+  ansible.builtin.import_tasks: fail2ban.yml
+  tags: [provision, node]
+
+- name: Configure syslog
+  ansible.builtin.import_tasks: syslog-ng.yml
+  tags: [provision, node]
+
+- name: Configure monitoring
+  ansible.builtin.import_tasks: monitoring.yml
+  tags: [provision, node]

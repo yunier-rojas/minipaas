@@ -50,4 +50,4 @@ The CLI is intentionally explicit: all changes are visible in Compose files or v
 
 For related components:
 
-- [Ansible Role Overview](/role/)
+- [Ansible Roles Overview](/role/)

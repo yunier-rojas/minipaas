@@ -60,7 +60,7 @@ Confirm the target is `service[:port]` inside the environment's namespace and th
 
 ## Cron Services Never Run
 
-`code cron` sets replicas to `0` and adds `swarm.cronjob.*` labels. The cluster needs `swarm-cronjob`, which the role installs on the primary manager:
+`code cron` sets replicas to `0` and adds `swarm.cronjob.*` labels. The cluster needs `swarm-cronjob`, which `minipaas-swarm` installs on the primary manager:
 
 ```bash
 systemctl status swarm-cronjob
@@ -84,4 +84,4 @@ Swarm requires TCP 2377, TCP/UDP 7946, and UDP 4789 between nodes. Check that nf
 
 ## Each New Manager Forms Its Own Cluster
 
-The role runs `swarm init` on every host in the `managers` group. Keep one host there and add capacity with `workers`. See **[Role Usage](/role/usage/)**.
+`minipaas-swarm` runs `swarm init` on every host in the `managers` group. Keep one host there and add capacity with `workers`. See **[Role Usage](/role/usage/)**.

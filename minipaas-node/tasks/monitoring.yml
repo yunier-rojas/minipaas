@@ -1,0 +1,57 @@
+---
+- name: Install monitoring packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - bc
+      - ipcalc
+      - jq
+      - gawk
+      - procps
+      - coreutils
+      - iproute2
+      - cron
+    state: present
+    update_cache: true
+  when: node_use_telegram | bool
+
+- name: Write Telegram secrets
+  ansible.builtin.copy:
+    dest: /etc/telegram.secrets
+    content: |
+      GROUP_ID="{{ telegram_chat_id }}"
+      BOT_TOKEN="{{ telegram_bot_token }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: node_use_telegram | bool
+
+- name: Install the monitoring script
+  ansible.builtin.get_url:
+    url: "{{ node_monitoring_script_url }}"
+    dest: /usr/local/bin/system-monitoring.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: node_use_telegram | bool
+
+- name: Write the server monitoring runner
+  ansible.builtin.copy:
+    dest: /usr/local/bin/server-monitoring.sh
+    content: |
+      #!/bin/sh
+      exec /usr/local/bin/system-monitoring.sh --NAME {{ inventory_hostname }} {{ node_monitoring_flags }}
+    owner: root
+    group: root
+    mode: "0755"
+  when: node_use_telegram | bool
+
+- name: Schedule monitoring at boot
+  ansible.builtin.cron:
+    name: Server Monitoring Script
+    special_time: reboot
+    job: /usr/local/bin/server-monitoring.sh
+    user: root
+    cron_file: monitoring-telegram
+  when: node_use_telegram | bool
